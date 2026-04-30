@@ -39,8 +39,8 @@ HS_DEFSESSIONTIMEOUT=3600
 HS_DEFIDLETIMEOUT=600
 HS_DEFINTERIMINTERVAL=300
 
-# Macauth — allow MAC whitelist auth (PRD 4.2.2)
-HS_MACAUTH=on
+# MACAUTH — disabled in v1 (no allowlist DB yet). Enable in v2.
+HS_MACAUTH=off
 HS_MACAUTHDENY=off
 
 # Misc
