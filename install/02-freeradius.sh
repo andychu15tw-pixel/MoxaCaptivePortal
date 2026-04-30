@@ -105,7 +105,14 @@ chown -R freerad:freerad "$FR_DIR"
 chmod 640 "$SQL_MOD"
 chmod 640 "$FR_DIR/clients.d/chilli.conf"
 
-# 6. Seed a test user (idempotent — INSERT IGNORE)
+# 6. Seed a test user (idempotent — INSERT IGNORE).
+#    daloRADIUS Users Listing requires a row in `userinfo` (it joins
+#    radcheck ↔ userinfo by username). Skipping userinfo means the user
+#    works for RADIUS auth but is invisible in the Web UI.
+#    The userinfo table is created by daloRADIUS schema in 05-daloradius.sh,
+#    so this section runs after both phase 02 and 05 — but is safe at any
+#    point because daloRADIUS schema is also imported during phase 02 (see
+#    daloRADIUS contrib SQL files).
 log "Seeding test user"
 mariadb "$RADIUS_DB_NAME" <<SQL
 INSERT IGNORE INTO radcheck (username, attribute, op, value)
@@ -115,7 +122,18 @@ INSERT IGNORE INTO radreply (username, attribute, op, value)
 INSERT IGNORE INTO radreply (username, attribute, op, value)
     VALUES ('testuser', 'Idle-Timeout', ':=', '600');
 SQL
-ok "Test user 'testuser' / 'test1234' seeded (Session-Timeout=3600, Idle=600)"
+
+# Seed userinfo entry only if the table exists (daloRADIUS schema present).
+if mariadb "$RADIUS_DB_NAME" -e 'SHOW TABLES LIKE "userinfo"' 2>/dev/null | grep -q userinfo; then
+    mariadb "$RADIUS_DB_NAME" <<SQL
+INSERT IGNORE INTO userinfo (username, firstname, lastname, email, creationdate, creationby)
+    VALUES ('testuser', 'Test', 'User', 'test@example.com', NOW(), 'admin');
+SQL
+    ok "Test user seeded in radcheck + radreply + userinfo"
+else
+    ok "Test user seeded in radcheck + radreply (userinfo skipped — table not yet present)"
+    warn "Re-run 02-freeradius.sh after 05-daloradius.sh to populate userinfo, or accept missing UI listing"
+fi
 
 # 7. Restart + verify
 systemctl enable freeradius
