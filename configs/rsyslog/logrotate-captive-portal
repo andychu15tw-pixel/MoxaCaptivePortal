@@ -1,0 +1,18 @@
+# /etc/logrotate.d/captive-portal
+# Rotate gateway-specific logs daily, keep 14 days.
+
+/var/log/chilli.log
+/var/log/firewall.log
+/var/log/daloradius/daloradius.log
+{
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate >/dev/null 2>&1 || true
+    endscript
+}

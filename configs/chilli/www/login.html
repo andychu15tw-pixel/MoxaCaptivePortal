@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Cache-Control" content="no-store">
+    <title>網路登入</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <main class="cp-container">
+        <img src="/logo.svg" alt="Logo" class="cp-logo">
+
+        <h1 class="cp-title">使用者登入</h1>
+        <p class="cp-subtitle">請輸入帳號密碼以連線網路</p>
+
+        <!--
+            CoovaChilli UAM flow:
+              chilli redirects unauthenticated clients to /cgi-bin/hotspotlogin.cgi
+              with ?challenge=&uamip=&uamport=&userurl= query string.
+              The CGI handles the CHAP challenge → RADIUS auth.
+            This static landing page is the post-redirect target if you want a
+            custom front door before the CGI; otherwise leave the redirect
+            target as the cgi directly (recommended for v1).
+        -->
+        <form class="cp-form" method="POST" action="/cgi-bin/hotspotlogin.cgi">
+            <label for="UserName">帳號</label>
+            <input type="text" id="UserName" name="UserName" autocomplete="username" required>
+
+            <label for="Password">密碼</label>
+            <input type="password" id="Password" name="Password" autocomplete="current-password" required>
+
+            <button type="submit" class="cp-button">登入</button>
+        </form>
+
+        <div class="cp-footer">
+            遇到問題請聯繫網路管理員
+        </div>
+    </main>
+</body>
+</html>

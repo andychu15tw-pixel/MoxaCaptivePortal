@@ -1,0 +1,59 @@
+# /etc/freeradius/3.0/mods-available/sql — MySQL/MariaDB connection
+# Rendered by install/02-freeradius.sh from configs/freeradius/sql-mysql.conf.tmpl
+#
+# Replaces the FreeRADIUS-shipped multi-dialect sql{} module file with a minimal
+# MySQL-only version. Query files referenced via $INCLUDE remain intact under
+# mods-config/sql/main/mysql/.
+#
+# DO NOT edit credentials by hand — re-run install/02-freeradius.sh; secrets
+# are in /etc/captive-portal/secrets.env.
+
+sql {
+    driver  = "rlm_sql_mysql"
+    dialect = "mysql"
+
+    # --- Connection ---
+    server      = "${RADIUS_DB_HOST}"
+    port        = 3306
+    login       = "${RADIUS_DB_USER}"
+    password    = "${RADIUS_DB_PASS}"
+    radius_db   = "${RADIUS_DB_NAME}"
+
+    # --- Read NAS clients from DB so daloRADIUS can manage them ---
+    read_clients = yes
+    client_table = "nas"
+
+    # --- Standard RADIUS table names (referenced by queries.conf) ---
+    accounting_table   = "radacct"
+    acct_table1        = "radacct"
+    acct_table2        = "radacct"
+    postauth_table     = "radpostauth"
+    authcheck_table    = "radcheck"
+    authreply_table    = "radreply"
+    groupcheck_table   = "radgroupcheck"
+    groupreply_table   = "radgroupreply"
+    usergroup_table    = "radusergroup"
+
+    # --- Group lookup ---
+    read_groups          = yes
+    delete_stale_sessions = yes
+
+    # --- Group attribute used in unlang policy ---
+    group_attribute = "SQL-Group"
+
+    # --- Connection pool ---
+    pool {
+        start          = 1
+        min            = 1
+        max            = 8
+        spare          = 1
+        uses           = 0
+        retry_delay    = 30
+        lifetime       = 0
+        idle_timeout   = 60
+        connect_timeout = 5
+    }
+
+    # --- Query files (shipped by freeradius-mysql package) ---
+    $INCLUDE ${modconfdir}/${.:name}/main/${dialect}/queries.conf
+}

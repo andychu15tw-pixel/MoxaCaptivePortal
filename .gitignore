@@ -1,0 +1,22 @@
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Build / runtime artefacts (only relevant if anyone runs scripts locally)
+*.log
+*.pid
+*.bak
+*.orig
+
+# Local secrets — never commit
+secrets.env
+*.key
+*.crt
+*.pem
+
+# IDE / Claude metadata
+.claude/
+.idea/
+.vscode/

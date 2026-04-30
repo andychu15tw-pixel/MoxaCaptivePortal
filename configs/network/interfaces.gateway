@@ -1,0 +1,23 @@
+# /etc/network/interfaces — Captive Portal Gateway
+# Deployed by install/00-base.sh
+#
+# Adjust IF_WAN / IF_LAN names if Moxa V2400/V3400 uses eno1/eno2 or other.
+
+source /etc/network/interfaces.d/*
+
+auto lo
+iface lo inet loopback
+
+# WAN — Ethernet, DHCP
+auto eth0
+iface eth0 inet dhcp
+
+# LAN — handed off to CoovaChilli (no IP here; chilli creates tun0)
+auto eth1
+iface eth1 inet manual
+    up   ip link set $IFACE up
+    up   ip link set $IFACE promisc on
+    down ip link set $IFACE down
+
+# wwan0 (Cellular) — managed by ModemManager, not ifupdown.
+# See install/07-cellular.sh (v2).

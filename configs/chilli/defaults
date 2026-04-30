@@ -1,0 +1,49 @@
+# /etc/chilli/defaults — CoovaChilli HS_* environment
+# Deployed by install/03-chilli.sh
+#
+# Variables marked ${VAR} are substituted at deploy time.
+
+HS_WANIF=${WAN_IF}
+HS_LANIF=${LAN_IF}
+
+HS_NETWORK=192.168.182.0
+HS_NETMASK=255.255.255.0
+HS_UAMLISTEN=192.168.182.1
+HS_UAMPORT=3990
+
+HS_NASID=moxa-cp-gw
+HS_NASIP=127.0.0.1
+
+# RADIUS — local FreeRADIUS
+HS_RADIUS=127.0.0.1
+HS_RADIUS2=127.0.0.1
+HS_RADSECRET=${CHILLI_RADIUS_SECRET}
+HS_UAMSECRET=${CHILLI_UAM_SECRET}
+
+# DNS — advertised to clients in DHCP. Points to our captive-dnsmasq on tun0.
+HS_DNS1=192.168.182.1
+HS_DNS2=192.168.182.1
+
+# UAM portal — served by Apache on the gateway IP itself.
+# HTTP (not HTTPS) so OS captive-portal probes follow the redirect.
+HS_UAMSERVER=192.168.182.1
+HS_UAMFORMAT=http://\$HS_UAMSERVER/cgi-bin/hotspotlogin.cgi
+HS_UAMHOMEPAGE=http://\$HS_UAMSERVER/
+
+# Walled garden — only the gateway itself. OS captive-probe domains MUST stay
+# OUT of uamallowed so chilli intercepts them and triggers OS popup.
+HS_UAMALLOW=192.168.182.1
+
+# Defaults — overridable per-user via RADIUS reply attributes
+HS_DEFSESSIONTIMEOUT=3600
+HS_DEFIDLETIMEOUT=600
+HS_DEFINTERIMINTERVAL=300
+
+# Macauth — allow MAC whitelist auth (PRD 4.2.2)
+HS_MACAUTH=on
+HS_MACAUTHDENY=off
+
+# Misc
+HS_TCP_PORTS="80 443"
+HS_ADMUSR=admin
+HS_ADMPWD=changeme-on-first-boot

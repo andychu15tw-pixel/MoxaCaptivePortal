@@ -1,0 +1,26 @@
+[Unit]
+Description=Captive Portal DNS proxy (dnsmasq on tun0)
+After=chilli.service network-online.target
+Wants=chilli.service
+Requires=chilli.service
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/dnsmasq \
+    --keep-in-foreground \
+    --no-daemon \
+    --log-queries \
+    --log-facility=- \
+    --interface=tun0 \
+    --bind-dynamic \
+    --resolv-file=/etc/resolv.conf \
+    --no-hosts \
+    --cache-size=400 \
+    --port=53 \
+    --conf-file=/dev/null \
+    --pid-file=/run/captive-dnsmasq.pid
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

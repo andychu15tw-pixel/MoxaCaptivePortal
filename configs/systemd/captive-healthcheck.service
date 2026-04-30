@@ -1,0 +1,12 @@
+[Unit]
+Description=Captive Portal healthcheck (chilli + freeradius)
+After=chilli.service freeradius.service apache2.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/captive-healthcheck.sh
+Restart=always
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target
