@@ -4,14 +4,14 @@ scripts/remote.py — Reusable SSH/SFTP helper for remote device management.
 Usage:
     from scripts.remote import RemoteBox
 
-    box = RemoteBox('10.90.35.42', 'moxa', 'admin@123')
+    box = RemoteBox('10.90.35.36', 'moxa', 'admin@123')
     out, err = box.run('hostname')
     out, err = box.sudo('systemctl status chilli', pw='admin@123')
     box.put('configs/chilli.conf', '/etc/chilli.conf')
     box.close()
 
 Jump host (reach LAN device through gateway):
-    gw  = RemoteBox('10.90.35.42', 'moxa', 'admin@123')
+    gw  = RemoteBox('10.90.35.36', 'moxa', 'admin@123')
     lan = RemoteBox('192.168.182.2', 'moxa', 'moxa', jump=gw)
 """
 
@@ -111,7 +111,7 @@ class RemoteBox:
 
 def moxa_box() -> RemoteBox:
     """Return a connected RemoteBox for the Moxa captive portal gateway."""
-    return RemoteBox("10.90.35.42", "moxa", "admin@123")
+    return RemoteBox("10.90.35.36", "moxa", "admin@123")
 
 
 def ubuntu_client(gw: RemoteBox | None = None) -> RemoteBox:

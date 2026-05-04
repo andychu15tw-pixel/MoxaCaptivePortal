@@ -6,7 +6,7 @@
 from scripts.remote import RemoteBox, moxa_box, ubuntu_client
 
 # Moxa gateway (direct)
-box = moxa_box()                    # 10.90.35.42 / moxa / admin@123
+box = moxa_box()                    # 10.90.35.36 / moxa / admin@123
 out, err = box.run('hostname')
 out, err = box.sudo('systemctl status chilli', pw='admin@123')
 
@@ -21,7 +21,7 @@ with moxa_box() as box:
 
 | 設備 | IP | User | Password |
 |------|----|------|----------|
-| Moxa V2426 (gateway) | 10.90.35.42 | moxa | admin@123 |
+| Moxa V2426 (gateway) | 10.90.35.36 (DHCP，重開機可能改變) | moxa | admin@123 |
 | Ubuntu client (LAN)  | 192.168.182.2 | moxa | moxa |
 
 sudo password = 登入密碼（兩台都一樣）
@@ -40,10 +40,10 @@ sudo password = 登入密碼（兩台都一樣）
 
 ## daloRADIUS Web UI
 
-- URL: `https://10.90.35.42/daloradius/`
+- URL: `https://10.90.35.36:8443/daloradius/`
 - 帳號: `administrator` / `radius`（預設，上線前改）
-- 踢人頁: `https://10.90.35.42/daloradius/config-maint-disconnect-user.php?username=<user>`
-- 編輯帳號: `https://10.90.35.42/daloradius/mng-edit.php?username=<user>`
+- 踢人頁: `https://10.90.35.36:8443/daloradius/config-maint-disconnect-user.php?username=<user>`
+- 編輯帳號: `https://10.90.35.36:8443/daloradius/mng-edit.php?username=<user>`
 
 ## 常用指令
 
