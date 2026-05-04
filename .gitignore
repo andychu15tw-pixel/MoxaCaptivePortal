@@ -9,6 +9,8 @@ Thumbs.db
 *.pid
 *.bak
 *.orig
+__pycache__/
+*.pyc
 
 # Local secrets — never commit
 secrets.env
