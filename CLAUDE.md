@@ -23,6 +23,7 @@ with moxa_box() as box:
 |------|----|------|----------|
 | Moxa V2426 (gateway) | 10.90.35.36 (DHCP，重開機可能改變) | moxa | admin@123 |
 | Ubuntu client (LAN)  | 192.168.182.2 | moxa | moxa |
+| Public RADIUS Server | 10.90.35.47 | andychu | admin@1234 |
 
 sudo password = 登入密碼（兩台都一樣）
 
@@ -65,8 +66,22 @@ nft list ruleset
 mysql -u root radius -e "SELECT * FROM radreply WHERE username='testuser';"
 ```
 
+## 公網 RADIUS Server (10.90.35.47)
+
+- chilli 設定：`radiusserver1 10.90.35.47`、`radiusserver2 127.0.0.1` (fallback)
+- daloRADIUS Web: `https://10.90.35.47/daloradius/`（透過 Moxa SSH jump 接觸）
+- 安裝手冊：[docs/radius-public-server-manual.md](docs/radius-public-server-manual.md)
+- SSH 連法：
+
+```python
+from scripts.remote import RemoteBox, moxa_box
+gw = moxa_box()
+radius_srv = RemoteBox('10.90.35.47', 'andychu', 'admin@1234', jump=gw)
+```
+
 ## 專案階段
 
 - **v0 PoC** ✅ — DHCP / redirect / RADIUS auth / accounting
 - **v1 MVP** ✅ — daloRADIUS / portal 客製 / WISPr 限速 / CoA 踢人 / firewall
+- **v1.5 Public RADIUS** ✅ — 把 RADIUS server 搬到公網 10.90.35.47，Moxa 只留 chilli
 - **v2** 🔲 — Cellular WAN / WAN failover / 壓測 / SNMP / rsyslog
