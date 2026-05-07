@@ -399,6 +399,18 @@ sudo systemctl enable --now nftables
 
 > **原則：保留 Moxa 既有 freeradius/daloRADIUS（可當 fallback），只改 chilli.conf 指向公網。**
 
+### 4.0 Moxa nftables 開 CoA 入站
+
+之前 RADIUS 在 127.0.0.1 走 loopback，不進 filter chain。改外部後，CoA (UDP 3799) 從公網入 Moxa 會被 fw 擋。加白名單：
+
+```bash
+# 即時生效
+sudo nft 'add rule inet filter input ip saddr 10.90.35.47 udp dport 3799 accept comment "CoA from public RADIUS"'
+
+# 持久化到 /etc/nftables.conf — snmp from MGMT_NET 規則之後加一行
+sudo sed -i '/snmp from MGMT_NET/a\        ip saddr 10.90.35.47 udp dport 3799 accept comment "CoA from public RADIUS"' /etc/nftables.conf
+```
+
 ### 4.1 改 `/etc/chilli.conf`
 
 ```bash
@@ -525,7 +537,13 @@ SECRET=$(sudo grep ^CHILLI_RADIUS_SECRET= /etc/captive-portal/secrets.env | cut 
 echo 'User-Name="testuser"' | radclient 10.90.35.36:3799 disconnect ${SECRET}
 ```
 
-> CoA 是公網 server → Moxa 方向（端口 3799），Moxa nftables 已開該 port。
+> **重要：chilli 1.6 CoA 行為**
+> - 必須包含 `User-Name` 屬性
+> - 單獨 `Acct-Session-Id` 或 `Calling-Station-Id` 會被 chilli silent drop（無回應、無 log）
+> - daloRADIUS 預設送 `User-Name`，可正常運作
+>
+> CoA 是公網 server → Moxa 方向（端口 3799），需要 Moxa nftables 開放（見 §4.0）。
+> 成功踢人後 radacct 會記錄 `acctterminatecause = Admin-Reset`。
 
 ### 6.3 查 log
 
@@ -596,6 +614,37 @@ sudo freeradius -CX 2>&1 | tail -50
 - 看 `grep radiusserver /etc/chilli.conf` 是否真的改了
 - `systemctl restart chilli` 後再驗
 - chilli 重啟所有 client 都要重認證（normal）
+
+### 7.6 CoA disconnect 沒回應 (silent drop)
+
+**症狀：** `radclient ... disconnect` 從公網或 Moxa loopback 都收不到回應，chilli journal 沒記錄。
+
+**原因 1：Moxa nftables 沒開 3799 入站**
+```bash
+# Moxa 上看
+sudo nft list ruleset | grep 3799
+# 沒看到 → 走 §4.0 加 rule
+```
+
+**原因 2：CoA 缺 `User-Name` 屬性**
+- chilli 1.6 必須用 `User-Name` 來 lookup session
+- 單獨 `Acct-Session-Id` / `Calling-Station-Id` 不行
+
+**驗證 (從 Moxa loopback 試)：**
+```bash
+SECRET=$(sudo grep ^CHILLI_RADIUS_SECRET= /etc/captive-portal/secrets.env | cut -d= -f2-)
+echo 'User-Name=andychu' | radclient -x 127.0.0.1:3799 disconnect ${SECRET}
+# 期待：Disconnect-ACK
+# 確認 chilli CoA 本身通，再排查網路/firewall
+```
+
+**tcpdump 觀察封包到達：**
+```bash
+# Moxa
+sudo tcpdump -i any -nn udp port 3799
+# 公網送 CoA → 看到 In packet
+# chilli 處理 → 看到 Out packet（ACK）
+```
 
 ---
 
