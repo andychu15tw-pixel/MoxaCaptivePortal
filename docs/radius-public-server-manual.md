@@ -106,7 +106,7 @@ sudo apt update
 sudo apt install -y \
   freeradius freeradius-mysql freeradius-utils \
   mariadb-server \
-  apache2 php php-mysql php-mbstring php-gd php-curl php-xml \
+  apache2 php php-mysql php-mbstring php-gd php-curl php-xml php-db php-pear \
   nftables curl wget unzip
 ```
 
@@ -598,10 +598,13 @@ sudo freeradius -CX 2>&1 | tail -50
 
 ### 7.3 daloRADIUS 500 error
 
+- **`Class "DB" not found`** → 缺 PEAR DB module：`sudo apt install -y php-pear php-db`，重啟 Apache
 - DB host/user/pass 不對：`/opt/daloradius/library/daloradius.conf.php`
 - DB user 沒權限：`SHOW GRANTS FOR 'radius'@'localhost';`
 - daloRADIUS schema 沒匯：跑 `contrib/db/*.sql`
 - Apache permission：`/opt/daloradius/` ownership 應為 `www-data`
+
+查 log：`sudo tail -50 /var/log/apache2/dalo-error.log`
 
 ### 7.4 portal 登入後仍看到登入頁
 
