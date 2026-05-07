@@ -529,21 +529,52 @@ EOF
 
 ### 6.2 踢人 (CoA / Disconnect)
 
-daloRADIUS：點 user → Disconnect
+daloRADIUS Web：Management → User → andychu → Disconnect User → 即可。
 
-或手動：
-```bash
-SECRET=$(sudo grep ^CHILLI_RADIUS_SECRET= /etc/captive-portal/secrets.env | cut -d= -f2-)
-echo 'User-Name="testuser"' | radclient 10.90.35.36:3799 disconnect ${SECRET}
+**完整流程（皆自動）：**
+
+```
+daloRADIUS Web "Disconnect User"
+  ↓ (PHP shell_exec ssh)
+SSH from public to Moxa (forced-command)
+  ↓
+/usr/local/sbin/coa-disconnect.sh <username>
+  ↓ (radclient 127.0.0.1:3799)
+chilli 處理 Disconnect-Request
+  ↓ (Disconnect-ACK + 終止 session)
+chilli 觸發 condown hook
+  ↓ /etc/chilli/condown.sh
+conntrack -D for 192.168.182.0/24 (LAN flush)
+  ↓
+Phone 立即失網，新連線跳 portal
 ```
 
-> **重要：chilli 1.6 CoA 行為**
-> - 必須包含 `User-Name` 屬性
-> - 單獨 `Acct-Session-Id` 或 `Calling-Station-Id` 會被 chilli silent drop（無回應、無 log）
-> - daloRADIUS 預設送 `User-Name`，可正常運作
->
-> CoA 是公網 server → Moxa 方向（端口 3799），需要 Moxa nftables 開放（見 §4.0）。
-> 成功踢人後 radacct 會記錄 `acctterminatecause = Admin-Reset`。
+**為何不直接 public→Moxa CoA？**
+- chilli 1.6 對 public source CoA silent drop（即使 `coanoipcheck=1` + Message-Authenticator 都不收）
+- chilli 對 loopback (127.0.0.1) CoA 100% 接受
+- 用 SSH 把 radclient 動作搬到 Moxa 本地解決
+
+**已知限制：Wi-Fi L2 連線不會斷**
+- chilli 是 L3 gateway，控制不到 AP 802.11 association
+- Phone Wi-Fi icon 仍亮，但 internet 通網被攔，新連線跳 portal
+- 想真斷 Wi-Fi 需 AP 端送 deauth (vendor-specific API)
+
+**手動 CLI 踢人（debug 用）：**
+
+```bash
+# Moxa 上跑（loopback，必通）：
+SECRET=$(sudo grep ^CHILLI_RADIUS_SECRET= /etc/captive-portal/secrets.env | cut -d= -f2-)
+echo 'User-Name=testuser' | radclient -t 3 -r 1 127.0.0.1:3799 disconnect ${SECRET}
+
+# 期待: Disconnect-ACK
+```
+
+**chilli 1.6 CoA 行為注意：**
+- 必須包含 `User-Name`（單獨 `Acct-Session-Id` / `Calling-Station-Id` silent drop）
+- 公網 source IP 即便加 `coanoipcheck` 也常被 silent drop（unknown chilli internal check）
+- 通用解：**用本機 loopback** 觸發 chilli CoA
+
+成功踢人後 radacct `acctterminatecause = Admin-Reset`。
 
 ### 6.3 查 log
 
@@ -664,6 +695,110 @@ sudo tcpdump -i any -nn udp port 3799
 | /etc/captive-portal/secrets.env | 600 perms，root only | 改用 vault (HashiCorp / SOPS) |
 
 ---
+
+## 8.4 SSH-based CoA Wrapper 部署
+
+公網 → Moxa CoA 被 chilli silent drop（chilli 1.6 internal 限制）。
+解法：daloRADIUS PHP 透過 SSH 觸發 Moxa 本機 radclient（loopback chilli CoA path 100% 通）。
+
+### 8.4.1 Public server (10.90.35.47) — 產生 SSH key for www-data
+
+```bash
+sudo -u www-data ssh-keygen -t ed25519 -N '' \
+  -f /var/www/.ssh/id_ed25519 -C daloradius-coa
+sudo cat /var/www/.ssh/id_ed25519.pub
+```
+
+### 8.4.2 Moxa (10.90.35.36) — 安裝 CoA wrapper + sudoers + authorized_keys
+
+```bash
+# CoA wrapper script
+sudo tee /usr/local/sbin/coa-disconnect.sh > /dev/null <<'EOF'
+#!/bin/bash
+# Called via SSH forced-command from public RADIUS server.
+set -eu
+USER_NAME="${1:-}"
+[[ -z "$USER_NAME" ]] && { echo "missing username" >&2; exit 1; }
+[[ ! "$USER_NAME" =~ ^[A-Za-z0-9_.@-]+$ ]] && { echo "invalid username: $USER_NAME" >&2; exit 1; }
+
+SECRET=$(sudo cat /etc/captive-portal/secrets.env | grep ^CHILLI_RADIUS_SECRET= | cut -d= -f2-)
+[[ -z "$SECRET" ]] && { echo "no secret" >&2; exit 1; }
+
+echo "User-Name=$USER_NAME" | sudo /usr/bin/radclient -t 3 -r 1 127.0.0.1:3799 disconnect "$SECRET"
+EOF
+
+sudo chmod 755 /usr/local/sbin/coa-disconnect.sh
+
+# sudoers for moxa user (radclient + secrets.env read)
+sudo tee /etc/sudoers.d/coa-disconnect > /dev/null <<'EOF'
+moxa ALL=(root) NOPASSWD: /usr/bin/radclient, /bin/cat /etc/captive-portal/secrets.env
+EOF
+sudo chmod 440 /etc/sudoers.d/coa-disconnect
+sudo visudo -c -f /etc/sudoers.d/coa-disconnect
+
+# authorized_keys with forced-command (replace PUBKEY with public的 .pub)
+PUBKEY="ssh-ed25519 AAAA... daloradius-coa"   # paste from §8.4.1
+echo "command=\"/usr/local/sbin/coa-disconnect.sh \${SSH_ORIGINAL_COMMAND}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty $PUBKEY" \
+  | sudo tee -a /home/moxa/.ssh/authorized_keys
+sudo chown -R moxa:moxa /home/moxa/.ssh
+sudo chmod 600 /home/moxa/.ssh/authorized_keys
+```
+
+### 8.4.3 Moxa — chilli `condown` hook flush conntrack
+
+```bash
+sudo apt install -y conntrack
+
+sudo tee /etc/chilli/condown.sh > /dev/null <<'EOF'
+#!/bin/sh
+# Runs on chilli session end (CoA, idle/session timeout, NAS-Reboot).
+# Brute-force flush conntrack for entire LAN /24 — single AP env.
+LAN_NET="192.168.182.0/24"
+BEFORE=$(/usr/sbin/conntrack -L 2>/dev/null | grep -c "src=192.168.182\." || echo 0)
+/usr/sbin/conntrack -D -s "$LAN_NET" >/dev/null 2>&1
+/usr/sbin/conntrack -D -d "$LAN_NET" >/dev/null 2>&1
+AFTER=$(/usr/sbin/conntrack -L 2>/dev/null | grep -c "src=192.168.182\." || echo 0)
+logger -t chilli-condown "session ended user=${USER_NAME:-?} mac=${CALLING_STATION_ID:-?} flushed=${BEFORE}->${AFTER}"
+exit 0
+EOF
+sudo chmod 755 /etc/chilli/condown.sh
+
+# Activate in chilli.conf
+echo "condown /etc/chilli/condown.sh" | sudo tee -a /etc/chilli.conf
+sudo systemctl restart chilli
+```
+
+### 8.4.4 Public server — patch daloRADIUS PHP
+
+`/opt/daloradius/library/exten-maint-radclient.php` 內 `user_disconnect()` 函式，把
+`shell_exec` 的 `$cmd` 改成 SSH wrapper:
+
+```php
+// before:
+$cmd = "echo \"".escapeshellcmd($query)."\" | $radclient $radclient_options $args 2>&1";
+
+// after:
+$cmd = "ssh -i /var/www/.ssh/id_ed25519 -o StrictHostKeyChecking=no \\
+  -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5 \\
+  moxa@10.90.35.36 ".$user." 2>&1";
+```
+
+只改 `user_disconnect`，**不要動** `user_auth`（那個還是用本機 radclient 對公網 freeradius 測 auth）。
+
+### 8.4.5 驗證
+
+```bash
+# 公網 server 測試
+sudo -u www-data ssh -i /var/www/.ssh/id_ed25519 \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  moxa@10.90.35.36 testuser
+# 期待：Disconnect-ACK
+```
+
+之後 daloRADIUS Web "Disconnect User" 按鈕：
+- DB 記錄 `Admin-Reset`
+- chilli condown 觸發 → conntrack `444->0`
+- Phone 立即失網
 
 ## 8.5 切換 External-Only / With-Fallback 模式
 
