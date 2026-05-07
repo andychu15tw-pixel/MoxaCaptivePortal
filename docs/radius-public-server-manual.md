@@ -665,6 +665,49 @@ sudo tcpdump -i any -nn udp port 3799
 
 ---
 
+## 8.5 切換 External-Only / With-Fallback 模式
+
+部署後預設是 **with-fallback**（chilli `radiusserver1=10.90.35.47`、`radiusserver2=127.0.0.1`），公網斷時自動切回 Moxa 本地。
+
+要驗證「**只有公網 RADIUS 在運作**」或正式上線維持單一來源，把 Moxa 本地服務徹底停下：
+
+### 切到 External-Only
+
+```bash
+ssh moxa@10.90.35.36
+
+# 1. 停 Moxa freeradius，並 mask 防 systemd auto-restart (Restart=always)
+sudo systemctl disable --now freeradius
+sudo systemctl mask freeradius
+
+# 2. Disable Moxa daloRADIUS Alias（保留 portal cgi！）
+#    注意：dalo.conf 內 "Alias /daloradius /opt/daloradius" 行注釋掉
+sudo sed -i 's|^\(\s*Alias /daloradius\)|#\1|' /etc/apache2/sites-available/dalo.conf
+sudo systemctl reload apache2
+
+# 3. 驗證
+sudo systemctl is-active freeradius              # inactive
+sudo systemctl is-enabled freeradius             # masked
+curl -sk -o /dev/null -w "%{http_code}\n" https://localhost:8443/daloradius/   # 403 (擋掉)
+curl -s  -o /dev/null -w "%{http_code}\n" http://localhost:8080/cgi-bin/hotspotlogin.cgi  # 200 (portal 仍活)
+```
+
+### 還原成 With-Fallback
+
+```bash
+sudo systemctl unmask freeradius
+sudo systemctl enable --now freeradius
+sudo sed -i 's|^#\(\s*Alias /daloradius\)|\1|' /etc/apache2/sites-available/dalo.conf
+sudo systemctl reload apache2
+
+sudo systemctl is-active freeradius              # active
+```
+
+> External-only 模式下：
+> - 公網 RADIUS 故障 → 全網無法認證
+> - Moxa portal cgi 仍服務（hotspotlogin.cgi 在 8080）
+> - 改 user/查 acct 一律走 https://10.90.35.47/daloradius/
+
 ## 9. 回滾步驟
 
 公網 server 故障時把 chilli 切回本地：
