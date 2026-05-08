@@ -1,221 +1,182 @@
 # Captive Portal Gateway — 從零手動安裝手冊
 
-> 本手冊：在一台空白 Debian 12 (bookworm) x86_64 機器上，**完全用手** 把整套 Captive Portal Gateway 架起來，不依賴 `install/*.sh` 自動腳本。
+> **架構假設：RADIUS server 在公網（獨立 server），Moxa 只跑 chilli。**
 >
-> 適用：理解原理、客製化部署、debug、出貨前 review。
+> 本手冊：在 **兩台** 空白 Debian 12 機器上，**完全用手** 把整套 Captive Portal Gateway 架起來：
+> - **Server A — Moxa Gateway**：CoovaChilli + Portal CGI + nftables (NAS only)
+> - **Server B — Public RADIUS Server**：MariaDB + FreeRADIUS + daloRADIUS (中央 AAA)
 >
-> 自動化腳本仍在 `install/` 目錄；本手冊把每個 phase 的實際指令拆解出來，加上設計動機與設定說明。
+> 兩台之間用 UDP RADIUS (1812/1813/3799) 通訊，加 SSH wrapper 解決 CoA 限制。
+>
+> 適用：理解原理、客製化部署、debug、出貨前 review、多 site 架構。
+>
+> 自動化腳本仍在 `install/`；本手冊把每個 phase 的實際指令拆解出來，加上設計動機與設定說明。
 
 ---
 
 ## 目錄
 
 1. [系統架構與元件](#1-系統架構與元件)
-2. [硬體 / OS 前置](#2-硬體--os-前置)
-3. [Phase A — Base OS Prep](#3-phase-a--base-os-prep)
-4. [Phase A.5 — 從 source build CoovaChilli](#4-phase-a5--從-source-build-coovachilli)
-5. [Phase B-1 — MariaDB](#5-phase-b-1--mariadb)
-6. [Phase B-2 — FreeRADIUS](#6-phase-b-2--freeradius)
-7. [Phase C — CoovaChilli 設定 + dnsmasq](#7-phase-c--coovachilli-設定--dnsmasq)
-8. [Phase D — Portal 客製](#8-phase-d--portal-客製)
-9. [Phase E — daloRADIUS Web UI + Apache](#9-phase-e--daloradius-web-ui--apache)
-10. [Phase F — nftables 防火牆 + NAT](#10-phase-f--nftables-防火牆--nat)
-11. [Phase H — Logging + SNMP](#11-phase-h--logging--snmp)
-12. [Phase I — Healthcheck](#12-phase-i--healthcheck)
-13. [完整驗證](#13-完整驗證)
-14. [疑難排解](#14-疑難排解)
+2. [硬體 / 網路 / OS 前置](#2-硬體--網路--os-前置)
+3. [Server B Phase 1 — Base + MariaDB](#3-server-b-phase-1--base--mariadb)
+4. [Server B Phase 2 — FreeRADIUS](#4-server-b-phase-2--freeradius)
+5. [Server B Phase 3 — daloRADIUS Web](#5-server-b-phase-3--daloradius-web)
+6. [Server B Phase 4 — nftables 白名單](#6-server-b-phase-4--nftables-白名單)
+7. [Server A Phase 1 — Base OS Prep](#7-server-a-phase-1--base-os-prep)
+8. [Server A Phase 2 — Build CoovaChilli](#8-server-a-phase-2--build-coovachilli)
+9. [Server A Phase 3 — chilli 設定 + dnsmasq](#9-server-a-phase-3--chilli-設定--dnsmasq)
+10. [Server A Phase 4 — Portal 客製](#10-server-a-phase-4--portal-客製)
+11. [Server A Phase 5 — nftables Gateway](#11-server-a-phase-5--nftables-gateway)
+12. [Server A Phase 6 — Logging + Healthcheck](#12-server-a-phase-6--logging--healthcheck)
+13. [SSH Wrapper for CoA Disconnect](#13-ssh-wrapper-for-coa-disconnect)
+14. [完整驗證 End-to-End](#14-完整驗證-end-to-end)
+15. [疑難排解](#15-疑難排解)
+16. [對照表 → 自動化腳本](#16-對照表--自動化腳本)
+17. [變體：Moxa-only All-in-One](#17-變體moxa-only-all-in-one)
 
 ---
 
 ## 1. 系統架構與元件
 
-### 拓樸
+### 拓樸（雙 server 架構）
 
 ```
-                 +---------------------------+
-                 |  Captive Portal Gateway   |
-                 |  Debian 12 x86_64         |
-                 |                           |
-[Wi-Fi AP] ─── eth1 ──── tun0 ─── chilli ─── eth0 ─── [Internet]
-                         192.168.182.1/24            10.x.x.x/?
-                         (LAN-side virtual)          (WAN DHCP)
-                         |
-                 ┌───────┴────────┐
-                 │ FreeRADIUS     │ ← chilli sends auth/acct/CoA here
-                 │ 127.0.0.1:1812 │
-                 └────────────────┘
-                         │
-                 ┌───────┴────────┐
-                 │ MariaDB        │ ← user / acct / nas tables
-                 └────────────────┘
-                         │
-                 ┌───────┴────────┐
-                 │ daloRADIUS Web │ ← https://<gw>/daloradius/
-                 │ (Apache + PHP) │
-                 └────────────────┘
++---------------------------------+              +---------------------------+
+|  Server A — Moxa Gateway        |              |  Server B — Public RADIUS |
+|  10.90.35.36 (DHCP) WAN         |              |  10.90.35.47              |
+|  Debian 12 x86_64               |              |  Debian 12 x86_64         |
+|                                 |              |                           |
+|  +---------------------------+  |              |  +---------------------+  |
+|  | CoovaChilli (NAS)         |  | UDP 1812 →   |  | FreeRADIUS 3.x      |  |
+|  |  - DHCP / DNS proxy       |  | UDP 1813 →   |  |  - SQL backend      |  |
+|  |  - UAM redirect           |  | UDP 3799 ←   |  +---------------------+  |
+|  |  - tun0 192.168.182.1/24  |  | (CoA)        |  +---------------------+  |
+|  +---------------------------+  |              |  | MariaDB             |  |
+|  +---------------------------+  |  TCP 22 →    |  |  radius DB          |  |
+|  | Apache (port 80) +        |  | (SSH wrapper |  +---------------------+  |
+|  | hotspotlogin.cgi          |  |  for CoA)    |  +---------------------+  |
+|  | + condown hook            |  |              |  | Apache + daloRADIUS |  |
+|  +---------------------------+  |              |  |  https://10.90.35.47|  |
+|  +---------------------------+  |              |  +---------------------+  |
+|  | nftables (FW + NAT)       |  |              |  +---------------------+  |
+|  +---------------------------+  |              |  | nftables (whitelist |  |
+|                                 |              |  |  Moxa for RADIUS)   |  |
+|  [Wi-Fi AP] ← eth1              |              |  +---------------------+  |
+|  [Internet] ← eth0              |              |                           |
++---------------------------------+              +---------------------------+
 ```
 
-### 元件職責一覽
+### 元件分配
 
-| 元件 | 套件 | 職責 |
-|------|------|------|
-| **CoovaChilli** | source build (1.6) | NAS — DHCP server、UAM redirect、RADIUS client、L3 ACL、conntrack mark |
-| **FreeRADIUS** | freeradius freeradius-mysql | 認證 (PAP/CHAP/MS-CHAP)、授權 (radreply / WISPr)、accounting |
-| **MariaDB** | mariadb-server | radius DB（radcheck/radreply/radacct/nas）+ daloRADIUS extras |
-| **Apache + PHP** | apache2 php php-mysql php-db php-pear ... | daloRADIUS Web UI、portal CGI 容器 |
-| **daloRADIUS** | github tarball at /opt/daloradius | Web 管理介面 (user/group/acct/CoA) |
-| **dnsmasq** | dnsmasq-base | 在 tun0 上 listen 53，給 client DNS（chilli 自己不開 53 listener） |
-| **nftables** | nftables | INPUT 防火牆 + WAN MASQUERADE NAT |
-| **rsyslog** | rsyslog | 把 chilli (local3) + nft drop 路由到 dedicated log files |
-| **snmpd** | snmpd | SNMPv3 監控介面 |
-| **healthcheck** | systemd service | curl portal cgi 失敗 → 自動 restart chilli |
-| **portal CGI** | haserl + login.chi | Captive portal 登入頁（HTML 表單 + CHAP 計算） |
+| Server | 元件 | 職責 |
+|--------|------|------|
+| **A (Moxa)** | CoovaChilli | NAS — DHCP、UAM redirect、RADIUS client、L3 ACL |
+| A | Apache + hotspotlogin.cgi | Portal HTML 表單、CHAP 計算 |
+| A | dnsmasq (tun0) | LAN 端 DNS proxy |
+| A | nftables | INPUT 防火牆 + WAN MASQUERADE NAT |
+| A | rsyslog + healthcheck | 在地 log 與自動恢復 |
+| **B (Public)** | MariaDB | 中央 radius DB (radcheck / radreply / radacct / nas) |
+| B | FreeRADIUS | 認證、授權、accounting |
+| B | Apache + PHP + daloRADIUS | Web 管理介面 (user / group / acct / CoA 觸發) |
+| B | nftables | 白名單只開 Moxa IP for RADIUS |
 
-### 為何這些選擇
+### 為何分離
 
-| 決策 | 理由 |
+| 理由 | 說明 |
 |------|------|
-| **CoovaChilli 而非 hostapd** | chilli 是純 L3 NAS，可搭配任何 AP；hostapd 強制 Moxa 自己當 AP |
-| **Source build chilli** | Debian 移除 `coova-chilli` 套件後 (Debian 9 後)，只能自己 build |
-| **FreeRADIUS + DB-backed users** | 工業標準，daloRADIUS 直接管 DB 即等於管 user |
-| **MariaDB（非 SQLite）** | daloRADIUS 需要 MySQL 相容；多服務共享 DB |
-| **daloRADIUS 非自寫 UI** | 現成、PHP 即裝、夠用 |
-| **`/opt/daloradius`（非 `/var/www`）** | Moxa 工業電腦的 ThingsPro 把 `/var/www` 連到受限 path，Apache 跟 symlink 會失敗 |
-| **Apache HTTP (port 80) 給 portal** | OS captive-portal probe 走 HTTP，自簽 HTTPS 會破 CNA 自動跳出 |
-| **dnsmasq 獨立 service** | chilli 1.6 不在 tun0 開 53 listener；client DHCP 拿到 192.168.182.1:53 必須有人接 |
-| **nftables（非 iptables）** | Debian 12 預設、語法清楚 |
+| **集中管理** | 多台 Moxa 共用一個 daloRADIUS / radius DB |
+| **資源釋放** | Moxa 工業電腦資源有限，PHP/MySQL 搬到雲機 |
+| **HA 路徑** | RADIUS server 可做 replication / failover |
+| **安全隔離** | 客流區 (Moxa) 與管理區 (RADIUS) 切開 |
+
+### 為何不直接踢人 (CoA path quirk)
+
+chilli 1.6 對 CoA Disconnect-Request 有 source IP 限制，**只接受 loopback (127.0.0.1)**。從 Server B 直接送 CoA 到 Server A 會 silent drop（即使加 `coanoipcheck=1` + Message-Authenticator）。
+
+**解法**：daloRADIUS PHP 改用 SSH 呼叫 Moxa 端 wrapper，wrapper 在 Moxa 本機跑 `radclient 127.0.0.1:3799`。詳見 §13。
 
 ---
 
-## 2. 硬體 / OS 前置
+## 2. 硬體 / 網路 / OS 前置
 
-### 硬體最低需求
+### 兩台 server 規格
 
-| 項目 | 最低 | 推薦 |
-|------|------|------|
-| CPU | x86_64 dual-core | Moxa V2426 / V3401 工業電腦 |
-| RAM | 2 GB | 4 GB |
-| 儲存 | 16 GB | 64 GB SSD |
-| 網卡 | 2 個 (WAN + LAN) | 2+ |
+| Server | 用途 | CPU | RAM | 儲存 | 網卡 |
+|--------|------|-----|-----|------|------|
+| A — Moxa Gateway | NAS | x86_64 dual | 2GB | 16GB+ | 2 (WAN+LAN) |
+| B — Public RADIUS | AAA | x86_64 dual | 2GB | 32GB+ | 1 |
 
-### 命名約定
+### 網路規劃
 
-本手冊假設：
-- WAN 介面 = `eth0`（連 internet 的 DHCP 介面）
-- LAN 介面 = `eth1`（chilli 接管，接 Wi-Fi AP 或直連 client）
+| 標的 | IP 範例 | 用途 |
+|------|---------|------|
+| Server A WAN (eth0) | 10.90.35.36 (DHCP 或 static) | 對外 + 連 Server B |
+| Server A LAN (eth1) | (no IP, chilli 接管) | 接 Wi-Fi AP |
+| Server A tun0 | 192.168.182.1/24 | chilli 虛擬 LAN |
+| Server B | 10.90.35.47 (建議 static) | RADIUS / Web UI |
+| Client subnet | 192.168.182.0/24 | DHCP from chilli |
+| Management subnet | 10.90.0.0/16 (例) | admin SSH/Web 來源 |
 
-如果你的介面名不同（例如 `enp1s0`），把後面所有 `eth0` / `eth1` 替換成你的實際名稱。
+### 必須連通
+
+| From | To | Port | Protocol | 用途 |
+|------|------|------|----------|------|
+| Server A | Server B | 1812, 1813 | UDP | RADIUS auth + acct |
+| Server B | Server A | 3799 | UDP | CoA (但實測 silent drop, 用 SSH 取代) |
+| Server B | Server A | 22 | TCP | SSH for CoA wrapper |
+| Mgmt subnet | Server A | 22 | TCP | admin SSH |
+| Mgmt subnet | Server B | 22, 80, 443 | TCP | admin SSH + daloRADIUS Web |
 
 ### OS 安裝
 
-1. 裝 Debian 12 (bookworm) **netinst** 或 **DVD**，server 模式（不選 desktop）
-2. 設 hostname、root 密碼、admin 帳號
-3. 確認 SSH 可從管理網段連入：
-   ```bash
-   sudo apt install -y openssh-server
-   sudo systemctl enable --now ssh
-   ```
-
-### 確認介面
-
-```bash
-ip link show
-# 應看到 eth0, eth1 (或你的實際名稱)
-```
-
----
-
-## 3. Phase A — Base OS Prep
-
-對應 `install/00-base.sh`。目的：裝套件、設 sysctl、寫 `/etc/network/interfaces`。
-
-### 3.1 安裝所有套件
+兩台都裝 Debian 12 (bookworm) **netinst** server 模式。
 
 ```bash
 sudo apt update
+sudo apt install -y openssh-server
+sudo systemctl enable --now ssh
+```
+
+### 確認介面（Server A）
+
+```bash
+ip link show
+# eth0 = WAN, eth1 = LAN
+```
+
+如果介面名不同，把後面 `eth0` / `eth1` 替換成實際名稱。
+
+---
+
+## 3. Server B Phase 1 — Base + MariaDB
+
+> **先架 Server B**（RADIUS 端）— Server A chilli 啟動時要連這個 RADIUS。
+
+### 3.1 安裝套件
+
+```bash
+ssh admin@10.90.35.47
+
+sudo apt update
 sudo DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
-  nftables \
   freeradius freeradius-mysql freeradius-utils \
   mariadb-server \
   apache2 \
   php php-mysql php-mbstring php-gd php-curl php-xml php-zip \
   php-db php-pear \
   libapache2-mod-php \
-  modemmanager \
-  dnsmasq-base \
-  iproute2 conntrack iputils-ping curl wget \
-  rsyslog logrotate \
-  snmpd snmp \
-  keepalived \
+  nftables \
+  conntrack \
   openssl ca-certificates \
-  gettext-base \
-  haserl \
-  libcgi-pm-perl \
-  git build-essential autoconf automake libtool pkg-config \
-  libssl-dev libcurl4-openssl-dev libjson-c-dev libnl-3-dev libnl-genl-3-dev \
-  gengetopt debhelper devscripts
+  curl wget \
+  rsyslog logrotate
 ```
 
-> `coova-chilli` 不在這裡 — Debian 12 已不提供 .deb，下個 phase 自己 build。
-
-### 3.2 sysctl — 啟用 forwarding 與 conntrack
-
-寫 `/etc/sysctl.d/99-gateway.conf`：
-
-```bash
-sudo tee /etc/sysctl.d/99-gateway.conf > /dev/null <<'EOF'
-net.ipv4.ip_forward=1
-net.netfilter.nf_conntrack_max=131072
-net.ipv4.conf.all.send_redirects=0
-net.ipv4.conf.default.send_redirects=0
-net.ipv4.conf.all.rp_filter=1
-EOF
-
-sudo sysctl --system
-sudo modprobe nf_conntrack
-sudo modprobe nf_nat
-```
-
-### 3.3 寫 `/etc/network/interfaces`
-
-```bash
-sudo cp /etc/network/interfaces /etc/network/interfaces.orig
-
-sudo tee /etc/network/interfaces > /dev/null <<'EOF'
-# WAN — DHCP from upstream
-auto eth0
-iface eth0 inet dhcp
-
-# LAN — handed to CoovaChilli (no IP, chilli puts 192.168.182.1 on tun0)
-auto eth1
-iface eth1 inet manual
-    up ip link set $IFACE up
-    down ip link set $IFACE down
-EOF
-```
-
-### 3.4 停用 NetworkManager（如有）
-
-```bash
-if systemctl is-enabled NetworkManager >/dev/null 2>&1; then
-    sudo systemctl disable --now NetworkManager
-fi
-```
-
-### 3.5 建立 secrets 與 env 目錄
+### 3.2 建 secrets
 
 ```bash
 sudo mkdir -p /etc/captive-portal
-sudo tee /etc/captive-portal/interfaces.env > /dev/null <<EOF
-WAN_IF=eth0
-LAN_IF=eth1
-EOF
-```
 
-> Phase B-1 與 Phase B-2 會在 `/etc/captive-portal/secrets.env` 寫入隨機產生的密碼與 secret。先把目錄建好。
-
-```bash
-# 產生隨機 secrets（24-byte hex）
 RADIUS_DB_PASS=$(openssl rand -hex 24)
 CHILLI_RADIUS_SECRET=$(openssl rand -hex 24)
 CHILLI_UAM_SECRET=$(openssl rand -hex 24)
@@ -226,124 +187,21 @@ CHILLI_RADIUS_SECRET=${CHILLI_RADIUS_SECRET}
 CHILLI_UAM_SECRET=${CHILLI_UAM_SECRET}
 EOF
 sudo chmod 600 /etc/captive-portal/secrets.env
-sudo chown root:root /etc/captive-portal/secrets.env
 ```
 
-**重要：把 `secrets.env` 內容備份，後面所有 phase 共用同一份 secret。**
+> **重要：之後要 `scp` 同一份 secrets.env 到 Server A**。兩台必須有相同 `CHILLI_RADIUS_SECRET`（chilli ↔ FreeRADIUS）與 `CHILLI_UAM_SECRET`（chilli ↔ portal CGI）。
 
-> 介面 rename 後**重開機**比較保險。
-
----
-
-## 4. Phase A.5 — 從 source build CoovaChilli
-
-對應 `install/00b-build-chilli.sh`。Debian 12 沒 `coova-chilli` package，必須自己 build。
-
-### 4.1 Clone repo
-
-```bash
-sudo git clone https://github.com/coova/coova-chilli.git /usr/local/src/coova-chilli
-cd /usr/local/src/coova-chilli
-sudo git fetch --tags --force
-sudo git checkout 1.6   # 或更新 tag
-```
-
-### 4.2 處理 gengetopt 不相容 patch（重要！）
-
-Debian 12 的 gengetopt 版本與 chilli 1.6 內附 `cmdline.patch` 不相容，會在 build 時 fail。把 patch 變空檔即可繞過：
-
-```bash
-[ -f src/cmdline.patch ] && sudo truncate -s 0 src/cmdline.patch
-```
-
-### 4.3 Bootstrap + configure
-
-```bash
-sudo ./bootstrap
-
-sudo CFLAGS="-O2 -Wno-error" ./configure \
-  --prefix=/usr \
-  --sysconfdir=/etc \
-  --localstatedir=/var \
-  --mandir=/usr/share/man \
-  --enable-largelimits \
-  --enable-binstatusfile \
-  --enable-statusfile \
-  --enable-redir \
-  --enable-chilliscript \
-  --enable-uamuiport \
-  --enable-miniportal \
-  --enable-layer3 \
-  --enable-proxyvsa \
-  --enable-miniconfig \
-  --enable-eapol \
-  --enable-uamdomainfile \
-  --with-openssl \
-  --without-curl \
-  --with-poll
-```
-
-> `--without-curl` 是因為 Moxa repo 的 libcurl link test 不穩；UAM portal 不需 chilliredir 的 curl。
-
-### 4.4 Build + install
-
-```bash
-sudo make           # 不要用 -j，cmdline.c 會 race
-sudo make install
-```
-
-### 4.5 寫 systemd unit
-
-upstream 只給 SysV init，自己寫 systemd unit：
-
-```bash
-sudo tee /etc/systemd/system/chilli.service > /dev/null <<'EOF'
-[Unit]
-Description=CoovaChilli Captive Portal
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=forking
-PIDFile=/var/run/chilli.pid
-EnvironmentFile=-/etc/chilli/defaults
-ExecStartPre=/usr/sbin/modprobe tun
-ExecStart=/usr/sbin/chilli
-Restart=always
-RestartSec=10s
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-```
-
-### 4.6 確認 binary
-
-```bash
-ldd /usr/sbin/chilli | grep -i "not found"   # 應無輸出
-ls -la /usr/sbin/chilli                       # 應 executable
-```
-
----
-
-## 5. Phase B-1 — MariaDB
-
-對應 `install/01-mariadb.sh`。
-
-### 5.1 啟用 + lockdown
+### 3.3 MariaDB 啟用
 
 ```bash
 sudo systemctl enable --now mariadb
 
-# 等 socket up
+# 等 socket
 for i in {1..10}; do
   sudo mariadb -e "SELECT 1" >/dev/null 2>&1 && break
   sleep 1
 done
 
-# 移除預設 anonymous user / test DB
 sudo mariadb <<'SQL'
 DELETE FROM mysql.user WHERE User='';
 DELETE FROM mysql.db WHERE Db='test' OR Db='test\_%';
@@ -352,11 +210,9 @@ FLUSH PRIVILEGES;
 SQL
 ```
 
-### 5.2 建 radius DB + user
+### 3.4 建 radius DB + user
 
 ```bash
-RADIUS_DB_PASS=$(sudo grep ^RADIUS_DB_PASS= /etc/captive-portal/secrets.env | cut -d= -f2-)
-
 sudo mariadb <<SQL
 CREATE DATABASE IF NOT EXISTS \`radius\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 CREATE USER IF NOT EXISTS 'radius'@'localhost' IDENTIFIED BY '$RADIUS_DB_PASS';
@@ -366,7 +222,7 @@ FLUSH PRIVILEGES;
 SQL
 ```
 
-### 5.3 寫 db.env
+### 3.5 寫 db.env
 
 ```bash
 sudo tee /etc/captive-portal/db.env > /dev/null <<EOF
@@ -376,38 +232,22 @@ RADIUS_DB_HOST=localhost
 EOF
 ```
 
-### 5.4 驗證
-
-```bash
-sudo mariadb -e "SHOW DATABASES;"
-# 應看到 radius
-sudo mariadb -u radius -p"$RADIUS_DB_PASS" radius -e "SHOW TABLES;"
-# 空表正常，下個 phase 匯入 schema
-```
-
 ---
 
-## 6. Phase B-2 — FreeRADIUS
+## 4. Server B Phase 2 — FreeRADIUS
 
-對應 `install/02-freeradius.sh`。
-
-### 6.1 匯入 RADIUS schema
+### 4.1 匯入 schema
 
 ```bash
 sudo mariadb radius < /etc/freeradius/3.0/mods-config/sql/main/mysql/schema.sql
 
-# 驗證
 sudo mariadb radius -e "SHOW TABLES;"
-# 應看到 radacct radcheck radreply radgroupcheck radgroupreply radusergroup radpostauth nas
+# radacct radcheck radreply radgroupcheck radgroupreply radusergroup radpostauth nas
 ```
 
-### 6.2 替換 sql module 設定
-
-預設 `/etc/freeradius/3.0/mods-available/sql` 是多 dialect 模板，改用 minimal MySQL 版：
+### 4.2 替換 sql module
 
 ```bash
-RADIUS_DB_PASS=$(sudo grep ^RADIUS_DB_PASS= /etc/captive-portal/secrets.env | cut -d= -f2-)
-
 sudo cp /etc/freeradius/3.0/mods-available/sql /etc/freeradius/3.0/mods-available/sql.orig
 
 sudo tee /etc/freeradius/3.0/mods-available/sql > /dev/null <<EOF
@@ -439,12 +279,12 @@ sql {
     group_attribute = "SQL-Group"
 
     pool {
-        start          = 1
-        min            = 1
-        max            = 8
-        spare          = 1
-        retry_delay    = 30
-        idle_timeout   = 60
+        start = 1
+        min   = 1
+        max   = 8
+        spare = 1
+        retry_delay = 30
+        idle_timeout = 60
         connect_timeout = 5
     }
 
@@ -457,9 +297,7 @@ sudo chmod 640 /etc/freeradius/3.0/mods-available/sql
 sudo ln -sf ../mods-available/sql /etc/freeradius/3.0/mods-enabled/sql
 ```
 
-### 6.3 啟用 sql 在 sites — default + inner-tunnel
-
-預設 sites 把 `sql` 行注釋掉。把 authorize / accounting / post-auth / session 段內的 `# sql` 改成 `sql`：
+### 4.3 啟用 sql 在 sites
 
 ```bash
 for site in default inner-tunnel; do
@@ -471,14 +309,13 @@ for site in default inner-tunnel; do
 done
 ```
 
-### 6.4 註冊 chilli 為 RADIUS client
+### 4.4 註冊 Moxa 為 RADIUS client
 
-預設 `clients.conf` 有個 `client localhost { ... secret = testing123 }`，與我們的 chilli 在 127.0.0.1 衝突。先把它注釋掉：
+預設 `client localhost { secret = testing123 }` 衝突，先注釋：
 
 ```bash
 sudo cp /etc/freeradius/3.0/clients.conf /etc/freeradius/3.0/clients.conf.orig
 
-# 用 awk 把 client localhost { ... } 整塊變註解
 sudo awk '
   /^client[[:space:]]+localhost([[:space:]]|\{)/ && !in_blk {
     print "# DISABLED-BY-CAPTIVE-PORTAL"
@@ -495,47 +332,55 @@ sudo awk '
 sudo chown freerad:freerad /etc/freeradius/3.0/clients.conf
 ```
 
-加 chilli client：
+加 Moxa client：
 
 ```bash
-CHILLI_RADIUS_SECRET=$(sudo grep ^CHILLI_RADIUS_SECRET= /etc/captive-portal/secrets.env | cut -d= -f2-)
+MOXA_WAN_IP="10.90.35.36"   # 改成實際 Moxa WAN IP
 
 sudo mkdir -p /etc/freeradius/3.0/clients.d
 
-sudo tee /etc/freeradius/3.0/clients.d/chilli.conf > /dev/null <<EOF
-# CoovaChilli on this gateway
-client chilli-localhost {
-    ipaddr     = 127.0.0.1
+sudo tee /etc/freeradius/3.0/clients.d/moxa.conf > /dev/null <<EOF
+# Moxa CoovaChilli — RADIUS NAS client
+client moxa-gateway {
+    ipaddr     = ${MOXA_WAN_IP}
     proto      = udp
     secret     = ${CHILLI_RADIUS_SECRET}
     require_message_authenticator = no
     nas_type   = other
-    shortname  = chilli
+    shortname  = moxa-chilli
 }
 EOF
 
-sudo chown root:freerad /etc/freeradius/3.0/clients.d/chilli.conf
-sudo chmod 640 /etc/freeradius/3.0/clients.d/chilli.conf
+sudo chown root:freerad /etc/freeradius/3.0/clients.d/moxa.conf
+sudo chmod 640 /etc/freeradius/3.0/clients.d/moxa.conf
 
-# 確認 clients.conf 有 include
+# 確認 include
 sudo grep -qF '$INCLUDE clients.d/' /etc/freeradius/3.0/clients.conf || \
   echo '$INCLUDE clients.d/' | sudo tee -a /etc/freeradius/3.0/clients.conf
 ```
 
-### 6.5 種一個測試 user
+> 多台 Moxa 各加一筆，shortname 不能重複。
+
+### 4.5 種測試 user + 預設 group
 
 ```bash
 sudo mariadb radius <<'SQL'
 INSERT IGNORE INTO radcheck (username, attribute, op, value)
     VALUES ('testuser', 'Cleartext-Password', ':=', 'test1234');
-INSERT IGNORE INTO radreply (username, attribute, op, value)
-    VALUES ('testuser', 'Session-Timeout', ':=', '3600');
-INSERT IGNORE INTO radreply (username, attribute, op, value)
-    VALUES ('testuser', 'Idle-Timeout', ':=', '600');
+
+-- default group with WISPr defaults
+INSERT IGNORE INTO radgroupreply (groupname,attribute,op,value) VALUES
+  ('default','Session-Timeout',':=','3600'),
+  ('default','Idle-Timeout',':=','600'),
+  ('default','WISPr-Bandwidth-Max-Down',':=','5000000'),
+  ('default','WISPr-Bandwidth-Max-Up',':=','5000000');
+
+INSERT IGNORE INTO radusergroup (username,groupname,priority)
+  VALUES ('testuser','default',1);
 SQL
 ```
 
-### 6.6 啟動 + smoke test
+### 4.6 啟動 + smoke test
 
 ```bash
 sudo systemctl enable freeradius
@@ -543,34 +388,391 @@ sudo systemctl restart freeradius
 sleep 2
 sudo systemctl is-active freeradius   # active
 
-# Smoke test
-SECRET=$(sudo grep ^CHILLI_RADIUS_SECRET= /etc/captive-portal/secrets.env | cut -d= -f2-)
-echo 'User-Name=testuser,User-Password=test1234' | \
-  radclient -x 127.0.0.1:1812 auth "$SECRET" 2>&1 | grep Access-
-# 期待: Received Access-Accept
-```
+# 本機 self-test（127.0.0.1 不在 clients.d 中，會 reject — normal）
+# 真正 smoke test 等 Server A 起來後從 Moxa 跑
 
-跑不起來看 log：
-```bash
-sudo journalctl -u freeradius -n 50
-sudo freeradius -CX 2>&1 | tail -30
+# Confirm listening
+sudo ss -ulnp | grep -E ':1812|:1813'
 ```
 
 ---
 
-## 7. Phase C — CoovaChilli 設定 + dnsmasq
+## 5. Server B Phase 3 — daloRADIUS Web
 
-對應 `install/03-chilli.sh`。
+### 5.1 下載 daloRADIUS
 
-### 7.1 寫 `/etc/chilli.conf`
+```bash
+DALO_TAG=$(curl -s https://api.github.com/repos/lirantal/daloradius/releases/latest \
+  | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/')
+
+cd /tmp
+wget "https://github.com/lirantal/daloradius/archive/refs/tags/${DALO_TAG}.tar.gz" -O dalo.tgz
+sudo tar xzf dalo.tgz
+sudo mv "daloradius-${DALO_TAG}" /opt/daloradius
+sudo chown -R www-data:www-data /opt/daloradius
+```
+
+### 5.2 匯入 daloRADIUS schema
+
+```bash
+for f in /opt/daloradius/contrib/db/mysql-daloradius.sql \
+         /opt/daloradius/contrib/db/fr3-mysql-daloradius-and-freeradius.sql; do
+  [ -f "$f" ] && sudo mariadb radius < "$f"
+done
+```
+
+### 5.3 設定 daloradius.conf.php
+
+```bash
+sudo cp /opt/daloradius/library/daloradius.conf.php.sample \
+        /opt/daloradius/library/daloradius.conf.php
+
+sudo sed -i \
+  -e "s|^\(\$configValues\['CONFIG_DB_ENGINE'\][[:space:]]*=[[:space:]]*\)'.*';|\1'mysqli';|" \
+  -e "s|^\(\$configValues\['CONFIG_DB_HOST'\][[:space:]]*=[[:space:]]*\)'.*';|\1'localhost';|" \
+  -e "s|^\(\$configValues\['CONFIG_DB_PORT'\][[:space:]]*=[[:space:]]*\)'.*';|\1'3306';|" \
+  -e "s|^\(\$configValues\['CONFIG_DB_USER'\][[:space:]]*=[[:space:]]*\)'.*';|\1'radius';|" \
+  -e "s|^\(\$configValues\['CONFIG_DB_PASS'\][[:space:]]*=[[:space:]]*\)'.*';|\1'$RADIUS_DB_PASS';|" \
+  -e "s|^\(\$configValues\['CONFIG_DB_NAME'\][[:space:]]*=[[:space:]]*\)'.*';|\1'radius';|" \
+  /opt/daloradius/library/daloradius.conf.php
+
+sudo chown www-data:www-data /opt/daloradius/library/daloradius.conf.php
+sudo chmod 640 /opt/daloradius/library/daloradius.conf.php
+sudo mkdir -p /var/log/daloradius
+sudo chown www-data:www-data /var/log/daloradius
+```
+
+### 5.4 自簽 cert
+
+```bash
+sudo openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+  -keyout /etc/ssl/private/captive-portal.key \
+  -out /etc/ssl/certs/captive-portal.crt \
+  -subj "/CN=10.90.35.47/O=Captive Portal Public RADIUS"
+sudo chmod 600 /etc/ssl/private/captive-portal.key
+```
+
+### 5.5 Apache vhost
+
+```bash
+sudo a2enmod ssl rewrite headers cgi alias
+
+sudo tee /etc/apache2/sites-available/dalo.conf > /dev/null <<'EOF'
+<VirtualHost *:80>
+    ServerName 10.90.35.47
+    RewriteEngine On
+    RewriteRule ^/(.*)$ https://%{HTTP_HOST}/$1 [R=301,L]
+</VirtualHost>
+
+<VirtualHost *:443>
+    ServerName 10.90.35.47
+    DocumentRoot /var/www/html
+
+    SSLEngine on
+    SSLCertificateFile    /etc/ssl/certs/captive-portal.crt
+    SSLCertificateKeyFile /etc/ssl/private/captive-portal.key
+    SSLProtocol           all -SSLv3 -TLSv1 -TLSv1.1
+    SSLCipherSuite        HIGH:!aNULL:!MD5
+    SSLHonorCipherOrder   on
+
+    Header always set Strict-Transport-Security "max-age=31536000"
+    Header always set X-Frame-Options "SAMEORIGIN"
+    Header always set X-Content-Type-Options "nosniff"
+
+    Alias /daloradius /opt/daloradius
+    DirectoryIndex login.php index.php
+    <Directory /opt/daloradius>
+        Options -Indexes +FollowSymLinks
+        AllowOverride All
+        Require all granted
+    </Directory>
+
+    ErrorLog  ${APACHE_LOG_DIR}/dalo-error.log
+    CustomLog ${APACHE_LOG_DIR}/dalo-access.log combined
+</VirtualHost>
+EOF
+
+sudo a2dissite 000-default 2>/dev/null || true
+sudo a2ensite dalo
+sudo apache2ctl configtest
+sudo systemctl enable apache2
+sudo systemctl restart apache2
+```
+
+### 5.6 註冊 chilli NAS in daloRADIUS DB
+
+```bash
+sudo mariadb radius <<SQL
+INSERT IGNORE INTO nas (nasname, shortname, type, ports, secret, server, community, description)
+    VALUES ('${MOXA_WAN_IP}', 'moxa-chilli', 'coovachilli', NULL,
+            '$CHILLI_RADIUS_SECRET', NULL, NULL, 'Moxa CoovaChilli (remote gateway)');
+SQL
+```
+
+### 5.7 登入 daloRADIUS
+
+URL：`https://10.90.35.47/daloradius/login.php`
+帳號：`administrator` / `radius`（**上線必改**）
+
+---
+
+## 6. Server B Phase 4 — nftables 白名單
+
+只開白名單給 Moxa（RADIUS）+ 管理子網（SSH/Web）：
+
+```bash
+sudo tee /etc/nftables.conf > /dev/null <<'EOF'
+#!/usr/sbin/nft -f
+flush ruleset
+
+table inet filter {
+    chain input {
+        type filter hook input priority filter; policy drop;
+
+        iif lo accept
+        ct state established,related accept
+        ct state invalid drop
+        ip protocol icmp limit rate 50/second accept
+        ip6 nexthdr icmpv6 accept
+
+        # SSH from management subnet
+        ip saddr 10.0.0.0/8 tcp dport 22 accept comment "ssh from MGMT"
+
+        # RADIUS auth + accounting + CoA from Moxa only
+        ip saddr 10.90.35.36 udp dport { 1812, 1813, 3799 } accept comment "RADIUS from Moxa"
+
+        # daloRADIUS Web UI from management subnet
+        ip saddr 10.0.0.0/8 tcp dport { 80, 443 } accept comment "Web admin from MGMT"
+
+        pkttype { broadcast, multicast } counter drop
+        log prefix "[fw-drop] " level info limit rate 5/second
+        counter drop
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+EOF
+
+sudo nft -c -f /etc/nftables.conf
+sudo systemctl enable --now nftables
+sudo systemctl restart nftables
+sudo nft list ruleset | head -30
+```
+
+> 上線把 `10.0.0.0/8` 縮到實際管理子網。多台 Moxa：`ip saddr { 10.90.35.36, 10.90.35.40 }`。
+
+**Server B 完工**。下面開始 Server A。
+
+---
+
+## 7. Server A Phase 1 — Base OS Prep
+
+### 7.1 SSH 進 Moxa
+
+```bash
+ssh moxa@10.90.35.36
+```
+
+### 7.2 安裝套件
+
+```bash
+sudo apt update
+sudo DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+  nftables \
+  freeradius-utils \
+  apache2 \
+  php php-cgi \
+  libapache2-mod-php \
+  modemmanager \
+  dnsmasq-base \
+  iproute2 conntrack iputils-ping curl wget \
+  rsyslog logrotate \
+  snmpd snmp \
+  keepalived \
+  openssl ca-certificates \
+  gettext-base \
+  haserl \
+  libcgi-pm-perl \
+  git build-essential autoconf automake libtool pkg-config \
+  libssl-dev libcurl4-openssl-dev libjson-c-dev libnl-3-dev libnl-genl-3-dev \
+  gengetopt debhelper devscripts
+```
+
+> 注意：**沒裝 `freeradius`、`mariadb-server`、`daloradius`、`php-mysql`** —— 那些都在 Server B。Moxa 只需要：
+> - `freeradius-utils`：給 `radclient` 用（CoA wrapper）
+> - `apache2 + php`：portal CGI host
+> - 其他基礎工具
+
+### 7.3 sysctl
+
+```bash
+sudo tee /etc/sysctl.d/99-gateway.conf > /dev/null <<'EOF'
+net.ipv4.ip_forward=1
+net.netfilter.nf_conntrack_max=131072
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+net.ipv4.conf.all.rp_filter=1
+EOF
+sudo sysctl --system
+sudo modprobe nf_conntrack
+sudo modprobe nf_nat
+```
+
+### 7.4 寫 `/etc/network/interfaces`
+
+```bash
+sudo cp /etc/network/interfaces /etc/network/interfaces.orig
+
+sudo tee /etc/network/interfaces > /dev/null <<'EOF'
+auto eth0
+iface eth0 inet dhcp
+
+auto eth1
+iface eth1 inet manual
+    up ip link set $IFACE up
+    down ip link set $IFACE down
+EOF
+```
+
+### 7.5 從 Server B 拷貝 secrets.env
+
+**重要**：兩台必須有同份 secrets。
+
+```bash
+# 在 Server B
+ssh admin@10.90.35.47 "sudo cat /etc/captive-portal/secrets.env" \
+  | sudo tee /tmp/secrets.env > /dev/null
+
+# 或 scp
+scp admin@10.90.35.47:/etc/captive-portal/secrets.env /tmp/secrets.env
+
+# 在 Server A
+sudo mkdir -p /etc/captive-portal
+sudo mv /tmp/secrets.env /etc/captive-portal/secrets.env
+sudo chmod 600 /etc/captive-portal/secrets.env
+sudo chown root:root /etc/captive-portal/secrets.env
+```
+
+寫 interfaces.env：
+
+```bash
+sudo tee /etc/captive-portal/interfaces.env > /dev/null <<EOF
+WAN_IF=eth0
+LAN_IF=eth1
+EOF
+```
+
+### 7.6 停 NetworkManager
+
+```bash
+if systemctl is-enabled NetworkManager >/dev/null 2>&1; then
+    sudo systemctl disable --now NetworkManager
+fi
+```
+
+> 介面 rename 後重開機。
+
+---
+
+## 8. Server A Phase 2 — Build CoovaChilli
+
+Debian 12 沒 `coova-chilli` package，自己 build。
+
+### 8.1 Clone
+
+```bash
+sudo git clone https://github.com/coova/coova-chilli.git /usr/local/src/coova-chilli
+cd /usr/local/src/coova-chilli
+sudo git fetch --tags --force
+sudo git checkout 1.6
+```
+
+### 8.2 修 gengetopt 不相容
+
+```bash
+[ -f src/cmdline.patch ] && sudo truncate -s 0 src/cmdline.patch
+```
+
+### 8.3 Bootstrap + configure
+
+```bash
+sudo ./bootstrap
+
+sudo CFLAGS="-O2 -Wno-error" ./configure \
+  --prefix=/usr \
+  --sysconfdir=/etc \
+  --localstatedir=/var \
+  --mandir=/usr/share/man \
+  --enable-largelimits \
+  --enable-binstatusfile \
+  --enable-statusfile \
+  --enable-redir \
+  --enable-chilliscript \
+  --enable-uamuiport \
+  --enable-miniportal \
+  --enable-layer3 \
+  --enable-proxyvsa \
+  --enable-miniconfig \
+  --enable-eapol \
+  --enable-uamdomainfile \
+  --with-openssl \
+  --without-curl \
+  --with-poll
+```
+
+### 8.4 Build + install
+
+```bash
+sudo make           # 不要 -j
+sudo make install
+```
+
+### 8.5 systemd unit
+
+```bash
+sudo tee /etc/systemd/system/chilli.service > /dev/null <<'EOF'
+[Unit]
+Description=CoovaChilli Captive Portal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/chilli.pid
+EnvironmentFile=-/etc/chilli/defaults
+ExecStartPre=/usr/sbin/modprobe tun
+ExecStart=/usr/sbin/chilli
+Restart=always
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+ldd /usr/sbin/chilli | grep -i "not found"   # 應無
+```
+
+---
+
+## 9. Server A Phase 3 — chilli 設定 + dnsmasq
+
+### 9.1 寫 `/etc/chilli.conf` — 指向公網 RADIUS
 
 ```bash
 LAN_IF=$(sudo grep ^LAN_IF= /etc/captive-portal/interfaces.env | cut -d= -f2-)
 CHILLI_RADIUS_SECRET=$(sudo grep ^CHILLI_RADIUS_SECRET= /etc/captive-portal/secrets.env | cut -d= -f2-)
 CHILLI_UAM_SECRET=$(sudo grep ^CHILLI_UAM_SECRET= /etc/captive-portal/secrets.env | cut -d= -f2-)
+RADIUS_SERVER="10.90.35.47"   # Server B IP
 
 sudo tee /etc/chilli.conf > /dev/null <<EOF
-# /etc/chilli.conf
+# /etc/chilli.conf — point to public RADIUS server
 dhcpif    ${LAN_IF}
 tundev    tun0
 
@@ -581,8 +783,10 @@ uamport   3990
 dns1 192.168.182.1
 dns2 192.168.182.1
 
-radiusserver1 127.0.0.1
-radiusserver2 127.0.0.1
+# Public RADIUS server (Server B). Optional fallback to 127.0.0.1 if you
+# keep a local freeradius for resilience (see §17).
+radiusserver1 ${RADIUS_SERVER}
+radiusserver2 ${RADIUS_SERVER}
 radiussecret  ${CHILLI_RADIUS_SECRET}
 radiusnasid   moxa-cp-gw
 radiusauthport 1812
@@ -597,23 +801,24 @@ uamallowed 192.168.182.1
 defsessiontimeout 3600
 defidletimeout    600
 definteriminterval 300
+defbandwidthmaxdown 5000000
+defbandwidthmaxup   5000000
 
 logfacility 3
 
 coaport 3799
+coanoipcheck 1
 nasmac
 swapoctets
 
-# Enable condown hook for conntrack flush on session end (見 §11)
+# CoA / disconnect hook → flush conntrack
 condown /etc/chilli/condown.sh
 EOF
 
 sudo chmod 600 /etc/chilli.conf
 ```
 
-### 7.2 寫 `/etc/chilli/defaults`
-
-login.chi (CGI) 從這讀環境變數：
+### 9.2 寫 `/etc/chilli/defaults`
 
 ```bash
 WAN_IF=$(sudo grep ^WAN_IF= /etc/captive-portal/interfaces.env | cut -d= -f2-)
@@ -630,8 +835,8 @@ HS_UAMPORT=3990
 HS_NASID=moxa-cp-gw
 HS_NASIP=127.0.0.1
 
-HS_RADIUS=127.0.0.1
-HS_RADIUS2=127.0.0.1
+HS_RADIUS=${RADIUS_SERVER}
+HS_RADIUS2=${RADIUS_SERVER}
 HS_RADSECRET=${CHILLI_RADIUS_SECRET}
 HS_UAMSECRET=${CHILLI_UAM_SECRET}
 
@@ -657,45 +862,35 @@ EOF
 sudo chmod 644 /etc/chilli/defaults
 ```
 
-### 7.3 啟用 + 移除 SysV init
+### 9.3 啟用 + 移除 SysV init
 
 ```bash
-# Debian wrapper
 [ -f /etc/default/chilli ] && \
   sudo sed -i 's/^START_CHILLI=.*/START_CHILLI=1/' /etc/default/chilli
 
-# 移除 source build 跑 make install 留下的 SysV init script（會擋 systemd）
 [ -f /etc/init.d/chilli ] && {
   sudo rm -f /etc/init.d/chilli
   sudo update-rc.d -f chilli remove >/dev/null 2>&1 || true
 }
 
 sudo modprobe tun
-
 sudo systemctl enable chilli
 sudo systemctl restart chilli
-```
 
-### 7.4 等 tun0 起來
-
-```bash
+# 等 tun0
 for i in {1..15}; do
   ip link show tun0 >/dev/null 2>&1 && { echo "tun0 up"; break; }
   sleep 1
 done
-
 ip -4 addr show tun0
-# 應看到 inet 192.168.182.1/24 scope global tun0
 ```
 
-### 7.5 部署 captive-dnsmasq
-
-chilli 1.6 不在 tun0 開 53 listener，client 需要 DNS：
+### 9.4 captive-dnsmasq
 
 ```bash
 sudo tee /etc/systemd/system/captive-dnsmasq.service > /dev/null <<'EOF'
 [Unit]
-Description=Captive portal DNS server (dnsmasq on tun0)
+Description=Captive portal DNS (dnsmasq on tun0)
 After=chilli.service
 Requires=chilli.service
 
@@ -719,16 +914,15 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable --now captive-dnsmasq
 sleep 1
-ss -tunlp | grep '192.168.182.1:53'   # 應看到
+ss -tunlp | grep '192.168.182.1:53'
 ```
 
-### 7.6 condown hook（自動 flush conntrack）
+### 9.5 condown hook（auto flush conntrack）
 
 ```bash
 sudo tee /etc/chilli/condown.sh > /dev/null <<'EOF'
 #!/bin/sh
 # Runs on chilli session end (CoA, idle/session timeout, NAS-Reboot).
-# Flush conntrack for entire LAN /24 — single AP env.
 LAN_NET="192.168.182.0/24"
 BEFORE=$(/usr/sbin/conntrack -L 2>/dev/null | grep -c "src=192.168.182\." || echo 0)
 /usr/sbin/conntrack -D -s "$LAN_NET" >/dev/null 2>&1
@@ -741,121 +935,42 @@ sudo chmod 755 /etc/chilli/condown.sh
 sudo systemctl restart chilli
 ```
 
----
-
-## 8. Phase D — Portal 客製
-
-對應 `install/04-portal-branding.sh`。
-
-### 8.1 客製靜態資源
-
-`/etc/chilli/www/` 內：
-- `logo.svg` — portal logo（SVG 或 PNG 都可，記得改 HTML reference）
-- `style.css` — CSS
-- `login.html` — landing page (optional)
-- `index.php` — 首頁
-
-直接覆寫即可：
+### 9.6 Smoke test：Moxa → 公網 RADIUS
 
 ```bash
-# 範例：放自家 logo
-sudo cp my-company-logo.svg /etc/chilli/www/logo.svg
-sudo chmod 644 /etc/chilli/www/logo.svg
+SECRET=$(sudo grep ^CHILLI_RADIUS_SECRET= /etc/captive-portal/secrets.env | cut -d= -f2-)
+echo 'User-Name=testuser,User-Password=test1234' | \
+  radclient -x ${RADIUS_SERVER}:1812 auth "$SECRET" 2>&1 | grep Access-
+# Received Access-Accept
 ```
 
-### 8.2 hotspotlogin.cgi wrapper
+---
 
-chilli 1.6 ship `login.chi` (haserl script) 但沒 `hotspotlogin.cgi`，要寫 wrapper 給 Apache CGI 容器：
+## 10. Server A Phase 4 — Portal 客製
 
 ```bash
+# 客製 logo / css
+# 把 my-logo.svg 放上去
+sudo cp my-company-logo.svg /etc/chilli/www/logo.svg
+
+# wrapper for haserl
 sudo tee /etc/chilli/www/hotspotlogin.cgi > /dev/null <<'EOF'
 #!/bin/bash
-# Apache cgi-script wrapper around chilli's haserl login.chi
 exec /usr/bin/haserl --shell=sh /etc/chilli/www/login.chi
 EOF
 sudo chmod 755 /etc/chilli/www/hotspotlogin.cgi
 ```
 
-### 8.3 中文化 / 客製訊息
-
-直接編 `/etc/chilli/www/login.chi`（haserl，HTML + 簡單 shell expression）。
-
-> 修改 cgi 屬於衍生作品，因 chilli GPL → 你的修改也須 GPL 並提供 source。詳見 license 章節。
-
----
-
-## 9. Phase E — daloRADIUS Web UI + Apache
-
-對應 `install/05-daloradius.sh`。
-
-### 9.1 下載 daloRADIUS
+Apache vhost on Server A — port 80 only（portal CGI），無 daloRADIUS：
 
 ```bash
-DALO_TAG=$(curl -s https://api.github.com/repos/lirantal/daloradius/releases/latest \
-  | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/')
+sudo a2enmod cgi alias rewrite
 
-cd /tmp
-wget "https://github.com/lirantal/daloradius/archive/refs/tags/${DALO_TAG}.tar.gz" -O dalo.tgz
-sudo tar xzf dalo.tgz
-sudo mv "daloradius-${DALO_TAG}" /opt/daloradius
-sudo chown -R www-data:www-data /opt/daloradius
-```
-
-### 9.2 匯入 daloRADIUS schema additions
-
-```bash
-for f in /opt/daloradius/contrib/db/mysql-daloradius.sql \
-         /opt/daloradius/contrib/db/fr3-mysql-daloradius-and-freeradius.sql; do
-  [ -f "$f" ] && sudo mariadb radius < "$f"
-done
-```
-
-### 9.3 設定 daloradius.conf.php
-
-從 sample 複製 + sed 改 DB 連線：
-
-```bash
-RADIUS_DB_PASS=$(sudo grep ^RADIUS_DB_PASS= /etc/captive-portal/secrets.env | cut -d= -f2-)
-
-sudo cp /opt/daloradius/library/daloradius.conf.php.sample \
-        /opt/daloradius/library/daloradius.conf.php
-
-sudo sed -i \
-  -e "s|^\(\$configValues\['CONFIG_DB_ENGINE'\][[:space:]]*=[[:space:]]*\)'.*';|\1'mysqli';|" \
-  -e "s|^\(\$configValues\['CONFIG_DB_HOST'\][[:space:]]*=[[:space:]]*\)'.*';|\1'localhost';|" \
-  -e "s|^\(\$configValues\['CONFIG_DB_PORT'\][[:space:]]*=[[:space:]]*\)'.*';|\1'3306';|" \
-  -e "s|^\(\$configValues\['CONFIG_DB_USER'\][[:space:]]*=[[:space:]]*\)'.*';|\1'radius';|" \
-  -e "s|^\(\$configValues\['CONFIG_DB_PASS'\][[:space:]]*=[[:space:]]*\)'.*';|\1'$RADIUS_DB_PASS';|" \
-  -e "s|^\(\$configValues\['CONFIG_DB_NAME'\][[:space:]]*=[[:space:]]*\)'.*';|\1'radius';|" \
-  /opt/daloradius/library/daloradius.conf.php
-
-sudo chown www-data:www-data /opt/daloradius/library/daloradius.conf.php
-sudo chmod 640 /opt/daloradius/library/daloradius.conf.php
-
-sudo mkdir -p /var/log/daloradius
-sudo chown www-data:www-data /var/log/daloradius
-```
-
-### 9.4 自簽 TLS 憑證
-
-```bash
-sudo openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
-  -keyout /etc/ssl/private/captive-portal.key \
-  -out /etc/ssl/certs/captive-portal.crt \
-  -subj "/CN=moxa-cp-gw"
-sudo chmod 600 /etc/ssl/private/captive-portal.key
-```
-
-### 9.5 Apache modules + vhost
-
-```bash
-sudo a2enmod ssl rewrite headers cgi alias
-
-sudo tee /etc/apache2/sites-available/dalo.conf > /dev/null <<'EOF'
+sudo tee /etc/apache2/sites-available/portal.conf > /dev/null <<'EOF'
 <VirtualHost *:80>
     ServerName moxa-cp-gw
-
     DocumentRoot /etc/chilli/www
+
     Alias /style.css   /etc/chilli/www/style.css
     Alias /logo.svg    /etc/chilli/www/logo.svg
     Alias /login.html  /etc/chilli/www/login.html
@@ -868,100 +983,36 @@ sudo tee /etc/apache2/sites-available/dalo.conf > /dev/null <<'EOF'
         Require all granted
     </Directory>
 
-    RewriteEngine On
-    RewriteRule ^/daloradius(.*)$ https://%{HTTP_HOST}/daloradius$1 [R=301,L]
-
-    ErrorLog  ${APACHE_LOG_DIR}/dalo-error.log
-    CustomLog ${APACHE_LOG_DIR}/dalo-access.log combined
-</VirtualHost>
-
-<VirtualHost *:443>
-    ServerName moxa-cp-gw
-    DocumentRoot /var/www/html
-
-    SSLEngine on
-    SSLCertificateFile    /etc/ssl/certs/captive-portal.crt
-    SSLCertificateKeyFile /etc/ssl/private/captive-portal.key
-    SSLProtocol           all -SSLv3 -TLSv1 -TLSv1.1
-    SSLCipherSuite        HIGH:!aNULL:!MD5
-    SSLHonorCipherOrder   on
-
-    Header always set Strict-Transport-Security "max-age=31536000"
-    Header always set X-Frame-Options "SAMEORIGIN"
-    Header always set X-Content-Type-Options "nosniff"
-
-    Alias /daloradius /opt/daloradius
-    DirectoryIndex login.php index.php
-    <Directory /opt/daloradius>
-        Options -Indexes +FollowSymLinks
-        AllowOverride All
-        Require all granted
-    </Directory>
-
-    Alias /style.css   /etc/chilli/www/style.css
-    Alias /logo.svg    /etc/chilli/www/logo.svg
-    Alias /login.html  /etc/chilli/www/login.html
-
-    ScriptAlias /cgi-bin/ /etc/chilli/www/
-    <Directory "/etc/chilli/www">
-        Options +ExecCGI
-        AddHandler cgi-script .cgi
-        Require all granted
-    </Directory>
-
-    ErrorLog  ${APACHE_LOG_DIR}/dalo-error.log
-    CustomLog ${APACHE_LOG_DIR}/dalo-access.log combined
+    ErrorLog  ${APACHE_LOG_DIR}/portal-error.log
+    CustomLog ${APACHE_LOG_DIR}/portal-access.log combined
 </VirtualHost>
 EOF
 
 sudo a2dissite 000-default 2>/dev/null || true
-sudo a2ensite dalo
+sudo a2ensite portal
 sudo apache2ctl configtest
 sudo systemctl enable apache2
 sudo systemctl restart apache2
 ```
 
-> 若 Moxa 機器有 ThingsPro nginx 占用 80/443，把 vhost 改成 8080/8443 即可。記得 `chilli.conf` 內 `uamserver` 也要對應改。
-
-### 9.6 在 daloRADIUS DB 註冊 chilli NAS
-
-```bash
-CHILLI_RADIUS_SECRET=$(sudo grep ^CHILLI_RADIUS_SECRET= /etc/captive-portal/secrets.env | cut -d= -f2-)
-
-sudo mariadb radius <<SQL
-INSERT IGNORE INTO nas (nasname, shortname, type, ports, secret, server, community, description)
-    VALUES ('127.0.0.1', 'chilli', 'coovachilli', NULL, '$CHILLI_RADIUS_SECRET', NULL, NULL, 'CoovaChilli on this gateway');
-SQL
-```
-
-### 9.7 登入 daloRADIUS
-
-URL：`https://<gw-ip>/daloradius/login.php`
-帳號：`administrator` / `radius`（**上線前必改**）
+> 若 Moxa ThingsPro nginx 占 80：改 8080 + chilli.conf `uamserver` 改 `:8080`。
 
 ---
 
-## 10. Phase F — nftables 防火牆 + NAT
-
-對應 `install/06-nftables.sh`。
+## 11. Server A Phase 5 — nftables Gateway
 
 ```bash
 WAN_IF=$(sudo grep ^WAN_IF= /etc/captive-portal/interfaces.env | cut -d= -f2-)
-MGMT_NET="${MGMT_NET:-0.0.0.0/0}"   # 上線改成你的管理子網
+RADIUS_SERVER="10.90.35.47"
+MGMT_NET="${MGMT_NET:-0.0.0.0/0}"
 
 sudo tee /etc/nftables.conf > /dev/null <<EOF
 #!/usr/sbin/nft -f
 flush ruleset
 
 table inet filter {
-    set wan_ifaces {
-        type ifname
-        elements = { "${WAN_IF}", "wwan0" }
-    }
-    set lan_ifaces {
-        type ifname
-        elements = { "tun0" }
-    }
+    set wan_ifaces { type ifname; elements = { "${WAN_IF}", "wwan0" } }
+    set lan_ifaces { type ifname; elements = { "tun0" } }
 
     chain input {
         type filter hook input priority filter; policy drop;
@@ -978,7 +1029,9 @@ table inet filter {
         iifname @lan_ifaces udp dport 53 accept comment "dns"
         iifname @lan_ifaces udp dport 67 accept comment "dhcp"
 
-        ip saddr ${MGMT_NET} tcp dport { 80, 443 } accept comment "admin from MGMT_NET"
+        # CoA from public RADIUS (Server B → Moxa)
+        ip saddr ${RADIUS_SERVER} udp dport 3799 accept comment "CoA from public RADIUS"
+
         ip saddr ${MGMT_NET} udp dport 161 accept comment "snmp from MGMT_NET"
 
         pkttype { broadcast, multicast } counter drop
@@ -1001,13 +1054,8 @@ table inet filter {
 }
 
 table ip nat {
-    set wan_ifaces {
-        type ifname
-        elements = { "${WAN_IF}", "wwan0" }
-    }
-    chain prerouting {
-        type nat hook prerouting priority dstnat; policy accept;
-    }
+    set wan_ifaces { type ifname; elements = { "${WAN_IF}", "wwan0" } }
+    chain prerouting { type nat hook prerouting priority dstnat; policy accept; }
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
         oifname @wan_ifaces masquerade
@@ -1015,29 +1063,20 @@ table ip nat {
 }
 EOF
 
-sudo chmod 644 /etc/nftables.conf
-sudo nft -c -f /etc/nftables.conf   # validate
+sudo nft -c -f /etc/nftables.conf
 sudo systemctl enable --now nftables
 sudo systemctl restart nftables
-sudo nft list ruleset | head -40
 ```
 
 ---
 
-## 11. Phase H — Logging + SNMP
+## 12. Server A Phase 6 — Logging + Healthcheck
 
-對應 `install/07-services.sh` 前半。
-
-### 11.1 rsyslog routes
-
-把 chilli (`local3` facility) 與 nft drops 路到專用 log file：
+### 12.1 rsyslog routes
 
 ```bash
 sudo tee /etc/rsyslog.d/30-captive-portal.conf > /dev/null <<'EOF'
-# chilli logs to local3 facility (configured in /etc/chilli.conf logfacility 3)
 local3.*    /var/log/chilli.log
-
-# Firewall drops (kernel msgs prefixed [fw-...])
 :msg, contains, "[fw-input-drop]"  /var/log/firewall.log
 :msg, contains, "[fw-fwd-drop]"    /var/log/firewall.log
 & stop
@@ -1048,14 +1087,8 @@ sudo chown syslog:adm /var/log/chilli.log /var/log/firewall.log 2>/dev/null || \
   sudo chown root:adm /var/log/chilli.log /var/log/firewall.log
 sudo chmod 640 /var/log/chilli.log /var/log/firewall.log
 
-sudo systemctl restart rsyslog
-```
-
-### 11.2 logrotate
-
-```bash
 sudo tee /etc/logrotate.d/captive-portal > /dev/null <<'EOF'
-/var/log/chilli.log /var/log/firewall.log /var/log/daloradius/*.log {
+/var/log/chilli.log /var/log/firewall.log {
     daily
     rotate 14
     compress
@@ -1068,15 +1101,16 @@ sudo tee /etc/logrotate.d/captive-portal > /dev/null <<'EOF'
     endscript
 }
 EOF
+
+sudo systemctl restart rsyslog
 ```
 
-### 11.3 SNMPv3
+### 12.2 SNMPv3
 
 ```bash
 SNMP_AUTH_PASS=$(openssl rand -hex 16)
 SNMP_PRIV_PASS=$(openssl rand -hex 16)
 
-# 加進 secrets.env
 sudo tee -a /etc/captive-portal/secrets.env > /dev/null <<EOF
 SNMP_AUTH_PASS=${SNMP_AUTH_PASS}
 SNMP_PRIV_PASS=${SNMP_PRIV_PASS}
@@ -1090,42 +1124,26 @@ sudo chmod 600 /var/lib/snmp/snmpd.conf
 
 sudo tee /etc/snmp/snmpd.conf > /dev/null <<'EOF'
 agentaddress udp:161
-
 rouser moxaadmin priv
-
 sysLocation "Captive Portal Gateway"
 sysContact  "admin@example.com"
-
 includeAllDisks 10%
 EOF
 
 sudo systemctl enable snmpd
 sudo systemctl restart snmpd
-
-# 驗證
-snmpwalk -v3 -u moxaadmin -l authPriv -a SHA -A "${SNMP_AUTH_PASS}" \
-         -x AES -X "${SNMP_PRIV_PASS}" 127.0.0.1 sysDescr.0
 ```
 
----
-
-## 12. Phase I — Healthcheck
-
-對應 `install/07-services.sh` 後半。
-
-### 12.1 Healthcheck script
+### 12.3 Healthcheck
 
 ```bash
 sudo tee /usr/local/sbin/captive-healthcheck.sh > /dev/null <<'EOF'
 #!/bin/bash
-# Periodic check: is portal CGI responding?
-# If not, restart chilli.
 set -u
 URL="http://192.168.182.1/cgi-bin/hotspotlogin.cgi"
-
 while true; do
     if ! curl -sS -m 5 -o /dev/null "$URL"; then
-        logger -t healthcheck "portal cgi not responding — restarting chilli"
+        logger -t healthcheck "portal cgi unreachable — restarting chilli"
         systemctl restart chilli
         sleep 30
     fi
@@ -1133,11 +1151,7 @@ while true; do
 done
 EOF
 sudo chmod 755 /usr/local/sbin/captive-healthcheck.sh
-```
 
-### 12.2 systemd unit
-
-```bash
 sudo tee /etc/systemd/system/captive-healthcheck.service > /dev/null <<'EOF'
 [Unit]
 Description=Captive Portal Healthcheck
@@ -1155,12 +1169,9 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now captive-healthcheck
-```
 
-### 12.3 Restart=always 給關鍵服務
-
-```bash
-for svc in chilli freeradius apache2 mariadb; do
+# Restart=always for critical services
+for svc in chilli apache2; do
   sudo mkdir -p "/etc/systemd/system/${svc}.service.d"
   sudo tee "/etc/systemd/system/${svc}.service.d/restart.conf" > /dev/null <<EOF
 [Service]
@@ -1173,152 +1184,286 @@ sudo systemctl daemon-reload
 
 ---
 
-## 13. 完整驗證
+## 13. SSH Wrapper for CoA Disconnect
 
-### 13.1 服務檢查
+> **背景**：chilli 1.6 silent-drops CoA Disconnect-Request 從非 loopback source。daloRADIUS 跑在 Server B，直接送 CoA 到 Server A 不會 ACK。**解法**：用 SSH 把 radclient 動作搬回 Moxa 本機跑。
+
+### 13.1 Server B — 給 www-data 產 SSH key
 
 ```bash
-for s in mariadb freeradius chilli captive-dnsmasq apache2 nftables snmpd captive-healthcheck; do
+ssh admin@10.90.35.47
+
+sudo mkdir -p /var/www/.ssh
+sudo chown www-data:www-data /var/www/.ssh
+sudo chmod 700 /var/www/.ssh
+
+sudo -u www-data ssh-keygen -t ed25519 -N '' \
+  -f /var/www/.ssh/id_ed25519 -C daloradius-coa
+
+sudo cat /var/www/.ssh/id_ed25519.pub
+# 複製 pubkey → 下一步用
+```
+
+### 13.2 Server A — 安裝 wrapper script + sudoers
+
+```bash
+ssh moxa@10.90.35.36
+
+# Wrapper script
+sudo tee /usr/local/sbin/coa-disconnect.sh > /dev/null <<'EOF'
+#!/bin/bash
+# Called via SSH forced-command from public RADIUS server.
+set -eu
+USER_NAME="${1:-}"
+[[ -z "$USER_NAME" ]] && { echo "missing username" >&2; exit 1; }
+[[ ! "$USER_NAME" =~ ^[A-Za-z0-9_.@-]+$ ]] && { echo "invalid username: $USER_NAME" >&2; exit 1; }
+
+SECRET=$(sudo cat /etc/captive-portal/secrets.env | grep ^CHILLI_RADIUS_SECRET= | cut -d= -f2-)
+[[ -z "$SECRET" ]] && { echo "no secret" >&2; exit 1; }
+
+echo "User-Name=$USER_NAME" | sudo /usr/bin/radclient -t 3 -r 1 127.0.0.1:3799 disconnect "$SECRET"
+EOF
+sudo chmod 755 /usr/local/sbin/coa-disconnect.sh
+
+# sudoers — moxa user can radclient + read secrets
+sudo tee /etc/sudoers.d/coa-disconnect > /dev/null <<'EOF'
+moxa ALL=(root) NOPASSWD: /usr/bin/radclient, /bin/cat /etc/captive-portal/secrets.env
+EOF
+sudo chmod 440 /etc/sudoers.d/coa-disconnect
+sudo visudo -c -f /etc/sudoers.d/coa-disconnect
+```
+
+### 13.3 Server A — 加 authorized_keys
+
+把 Server B 的 pubkey 黏進 Moxa 的 `/home/moxa/.ssh/authorized_keys`：
+
+```bash
+PUBKEY="ssh-ed25519 AAAAC3NzaC1...daloradius-coa"   # paste from §13.1
+
+sudo mkdir -p /home/moxa/.ssh
+echo "command=\"/usr/local/sbin/coa-disconnect.sh \${SSH_ORIGINAL_COMMAND}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty $PUBKEY" \
+  | sudo tee -a /home/moxa/.ssh/authorized_keys
+
+sudo chown -R moxa:moxa /home/moxa/.ssh
+sudo chmod 700 /home/moxa/.ssh
+sudo chmod 600 /home/moxa/.ssh/authorized_keys
+```
+
+### 13.4 Server B — patch daloRADIUS PHP
+
+`/opt/daloradius/library/exten-maint-radclient.php` 內 `user_disconnect()` 函式，把產 `$cmd` 那行改成 SSH wrapper。
+
+找：
+```php
+$cmd = "echo \"".escapeshellcmd($query)."\" | $radclient $radclient_options $args 2>&1";
+```
+
+改成：
+```php
+$cmd = "ssh -i /var/www/.ssh/id_ed25519 -o StrictHostKeyChecking=no \\
+  -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5 \\
+  moxa@10.90.35.36 ".$user." 2>&1";
+```
+
+只改 `user_disconnect` 函式內，**不要動** `user_auth`（那個還是用 radclient 對 RADIUS 做 auth test）。
+
+### 13.5 驗證 SSH wrapper
+
+```bash
+# Server B
+sudo -u www-data ssh -i /var/www/.ssh/id_ed25519 \
+  -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  moxa@10.90.35.36 testuser
+# Disconnect-ACK from 127.0.0.1:3799
+```
+
+---
+
+## 14. 完整驗證 End-to-End
+
+### 14.1 服務（兩台都要）
+
+**Server B：**
+```bash
+for s in mariadb freeradius apache2 nftables; do
+    printf '%-15s ' "$s"
+    sudo systemctl is-active "$s"
+done
+```
+
+**Server A：**
+```bash
+for s in chilli captive-dnsmasq apache2 nftables snmpd captive-healthcheck; do
     printf '%-25s ' "$s"
     sudo systemctl is-active "$s"
 done
-# 全部 active
 ```
 
-### 13.2 介面與 listener
+### 14.2 Listener 檢查
+
+| Server | Port | 應 |
+|--------|------|----|
+| B | 1812/udp | freeradius (auth) |
+| B | 1813/udp | freeradius (acct) |
+| B | 443/tcp | apache (daloRADIUS) |
+| B | 3306/tcp | mariadb (localhost only) |
+| A | 80/tcp | apache (portal) |
+| A | 53/udp on 192.168.182.1 | dnsmasq |
+| A | 3799/udp | chilli (CoA) |
+| A | 3990/tcp | chilli UAM |
+
+### 14.3 RADIUS auth path
 
 ```bash
-ip addr show tun0       # 192.168.182.1/24
-ss -tunlp | grep -E ':1812|:1813|:3799|:3990|:53|:80|:443|:161'
-# RADIUS 1812/1813、CoA 3799、UAM 3990、DNS 53@tun0、Web 80/443、SNMP 161
-```
-
-### 13.3 RADIUS auth smoke test
-
-```bash
+# Server A
 SECRET=$(sudo grep ^CHILLI_RADIUS_SECRET= /etc/captive-portal/secrets.env | cut -d= -f2-)
 echo 'User-Name=testuser,User-Password=test1234' | \
-  radclient -x 127.0.0.1:1812 auth "$SECRET" 2>&1 | grep Access-
-# Received Access-Accept
+  radclient -x 10.90.35.47:1812 auth "$SECRET" 2>&1 | grep -E "Access-|Session-Timeout|WISPr"
+# Access-Accept + Session-Timeout=3600 + WISPr-Bandwidth-Max-*=5000000
 ```
 
-### 13.4 端到端 client test
+### 14.4 Client 端
 
-從 LAN 接入一台 PC / 手機：
+接 client 進 LAN：
 
 | 項 | 應 |
 |---|---|
-| DHCP | 拿 192.168.182.x IP |
-| DNS query (`nslookup google.com`) | 應通 |
-| 開 `http://example.com` | 跳 portal hotspotlogin.cgi |
-| 輸入 `testuser / test1234` | 看到「登入成功」 |
-| 認證後上網 | OK |
-| daloRADIUS Web → Active Sessions | 看到該 client |
+| DHCP | 192.168.182.x IP |
+| 開 `http://example.com` | 跳 portal |
+| 輸入 `testuser/test1234` | 登入成功 |
+| 通網 | OK |
+| Server B daloRADIUS `Active Sessions` | 看到該 client |
+| Server B `radacct` | 寫入 acct row, nasipaddress=Moxa IP |
 
-### 13.5 CoA 踢人
+### 14.5 CoA 踢人（Web）
 
-daloRADIUS Web → User → testuser → Disconnect User
-- DB radacct: `acctterminatecause = Admin-Reset`
-- chilli condown 觸發：`logger -t chilli-condown ...`
-- conntrack flush：`/var/log/syslog` 找 "flushed=N->0"
+daloRADIUS Web → Users → testuser → **Disconnect User**：
 
-或 CLI：
+| 應 | 證 |
+|---|---|
+| daloRADIUS UI 顯示 success | 有 |
+| Server A `journalctl -t chilli-condown` | `flushed=N->0` |
+| Server B radacct | `acctterminatecause=Admin-Reset` |
+| Client | 新連線跳 portal（舊已建立的 UDP 短期內 timeout） |
+
+### 14.6 防火牆 scoping
+
 ```bash
-echo 'User-Name=testuser' | radclient -t 3 -r 1 127.0.0.1:3799 disconnect "$SECRET"
-# Disconnect-ACK
+# 從非白名單 IP 試送 RADIUS
+# 應 timeout / no reply
 ```
 
 ---
 
-## 14. 疑難排解
+## 15. 疑難排解
 
-### 14.1 chilli 起不來
-```bash
-sudo journalctl -u chilli -n 50
-sudo /usr/sbin/chilli -fd        # foreground debug 模式
-```
-常見原因：
-- LAN 介面不存在或被別的 service 佔用 → 檢查 `dhcpif`
-- tun module 未 load → `sudo modprobe tun`
-- /etc/chilli.conf 語法錯 → 看 journal
+### 15.1 Moxa → Server B RADIUS 失敗
 
-### 14.2 FreeRADIUS auth 失敗
-```bash
-sudo freeradius -X 2>&1 | tail -50      # foreground debug
-sudo journalctl -u freeradius -n 50
-sudo tail -f /var/log/freeradius/radius.log
-```
-常見：
-- secret 不符 → `clients.d/chilli.conf` vs `chilli.conf` `radiussecret`
-- DB 連不上 → mods-enabled/sql password 對不對
-- duplicate client → default `client localhost` 沒注釋掉
+| 症狀 | 解 |
+|------|----|
+| `Access-Reject` | clients.d/moxa.conf secret 不符 chilli `radiussecret` |
+| 無 reply | Server B fw 沒開白名單 / network unreachable |
+| FreeRADIUS 起不來 | 跑 `sudo freeradius -CX 2>&1 \| tail -50` 看錯誤；常見：default `client localhost` 沒注釋、`-sql` 變 `?sql` |
 
-### 14.3 daloRADIUS 500 error
+### 15.2 daloRADIUS 500
+
 ```bash
 sudo tail /var/log/apache2/dalo-error.log
 ```
-常見：
 - `Class "DB" not found` → 缺 `php-pear php-db`
 - DB 連不上 → daloradius.conf.php 密碼錯
-- 權限 → `/opt/daloradius` 應為 www-data 所有
+- 權限 → `/opt/daloradius` ownership www-data
 
-### 14.4 Portal 不跳出
-```bash
-# Client 端
-curl -v http://example.com 2>&1 | head -20
-# 應 302 到 192.168.182.1
-```
-- chilli 沒 forward 到 UAM → 看 chilli log
-- DNS 失敗 → captive-dnsmasq 沒 running，client 解不到主機名
-- 客戶端開 HTTPS-Only → HSTS 站點不能攔（normal）
+### 15.3 CoA 踢人沒效
 
-### 14.5 Conntrack 不 flush
-- `condown.sh` 有沒 +x？
-- `conntrack` 有沒裝？`apt install conntrack`
-- chilli.conf 有沒 `condown /etc/chilli/condown.sh`？
+| 症狀 | 排查 |
+|------|------|
+| Web `Disconnect User` 顯示 success 但無感 | SSH wrapper 沒裝 / pubkey 沒 install / sudoers 沒設 |
+| condown 沒 fire | `chilli.conf` 漏 `condown /etc/chilli/condown.sh`；script 沒 +x |
+| 踢後 phone 仍上網 | Conntrack 沒 flush（裝 `conntrack` 套件、確認 condown 執行）|
+| 踢成功但 Web 顯示 "No reply" | chilli ACK 但 reply 路徑被擋（無傷，DB 已寫 Admin-Reset） |
 
-### 14.6 Wi-Fi 「無網際網路」但仍連著
+### 15.4 Phone Wi-Fi 還連著（ICON 亮但無網）
+
 - 正常。chilli 是 L3，AP 端 802.11 association 不歸 chilli 管
-- 真斷需要 AP API（vendor-specific）
+- 真斷需要 AP 廠牌 API（vendor-specific deauth frame）
+- 用戶體驗：開新網頁 → 跳 portal 重登
 
----
+### 15.5 chilli 起不來
 
-## 15. 對照檔案 / 自動化腳本
-
-| 手冊章節 | 對應 install script |
-|---------|---------------------|
-| §3 Phase A | `install/00-base.sh` |
-| §4 Phase A.5 | `install/00b-build-chilli.sh` |
-| §5 Phase B-1 | `install/01-mariadb.sh` |
-| §6 Phase B-2 | `install/02-freeradius.sh` |
-| §7 Phase C | `install/03-chilli.sh` |
-| §8 Phase D | `install/04-portal-branding.sh` |
-| §9 Phase E | `install/05-daloradius.sh` |
-| §10 Phase F | `install/06-nftables.sh` |
-| §11-§12 | `install/07-services.sh` |
-| Cellular WAN (v2) | `install/08-cellular.sh` |
-
-自動化整套：
 ```bash
-sudo ./install/00-base.sh
-sudo ./install/00b-build-chilli.sh
-sudo ./install/01-mariadb.sh
-sudo ./install/02-freeradius.sh
-sudo ./install/03-chilli.sh
-sudo ./install/04-portal-branding.sh
-sudo ./install/05-daloradius.sh
-sudo ./install/06-nftables.sh
-sudo ./install/07-services.sh
+sudo journalctl -u chilli -n 50
+sudo /usr/sbin/chilli -fd      # foreground debug
 ```
+- LAN 介面被佔 → 確認 NetworkManager disabled
+- tun module 未 load → `sudo modprobe tun`
+- /etc/chilli.conf 語法錯
+
+### 15.6 Portal 不跳出
+
+```bash
+# Client
+curl -v http://example.com 2>&1 | head -20
+# 應 302 to 192.168.182.1
+```
+- chilli 沒 forward → 看 `/var/log/chilli.log`
+- DNS 失敗 → captive-dnsmasq 沒 running
+- HSTS 站點不可攔（normal 行為）
 
 ---
 
-## 16. 後續工作
+## 16. 對照表 → 自動化腳本
 
-| 項目 | 對應手冊 |
-|------|---------|
-| 把 RADIUS server 搬到公網 | [docs/radius-public-server-manual.md](radius-public-server-manual.md) |
-| Cellular WAN failover | `install/08-cellular.sh`（v2） |
-| 多 AP / 多 site 部署 | 同 RADIUS 公網手冊 §10.4 |
-| 升級 RadSec / WireGuard | 同上 |
-| 商品散佈 license 注意事項 | 主要 GPL 元件：CoovaChilli、FreeRADIUS、daloRADIUS、MariaDB — 散佈須提供 source |
+本手冊章節對應 `install/*.sh`：
+
+| 手冊章節 | install script | Server | 備註 |
+|---------|---------------|--------|------|
+| §3 Server B Base+MariaDB | `01-mariadb.sh` | B | |
+| §4 Server B FreeRADIUS | `02-freeradius.sh` | B | clients.d 改用 Moxa IP |
+| §5 Server B daloRADIUS | `05-daloradius.sh` | B | |
+| §6 Server B nftables | `06-nftables.sh` | B | 白名單 only Moxa IP |
+| §7 Server A Base | `00-base.sh` | A | 套件清單少 freeradius/mariadb |
+| §8 Server A Build chilli | `00b-build-chilli.sh` | A | |
+| §9 Server A chilli config | `03-chilli.sh` | A | radiusserver 指公網 |
+| §10 Server A Portal | `04-portal-branding.sh` | A | |
+| §11 Server A nftables | `06-nftables.sh` | A | gateway 規則 |
+| §12 Server A Logging | `07-services.sh` | A | |
+| §13 SSH Wrapper | (自動腳本未涵蓋) | A+B | 手動部署 |
+
+> 自動化腳本目前是 Moxa-only all-in-one 設計。雙 server 部署建議先跑各自 server 對應 phase，再手動加 SSH wrapper。
+
+---
+
+## 17. 變體：Moxa-only All-in-One
+
+不想搞兩台機器？所有元件都裝在 Moxa 上：
+
+1. 跑 §3 + §4 + §5（Server B 步驟）但**全在 Moxa 上跑**
+2. `/etc/chilli.conf` `radiusserver1 127.0.0.1`（不是公網 IP）
+3. `clients.d/moxa.conf` ipaddr 改 `127.0.0.1` shortname `chilli`
+4. daloRADIUS Web URL 變 `https://<moxa-ip>/daloradius/`
+5. **不用 SSH wrapper**（Web → CoA 直接走 loopback）
+6. **不用** §6 firewall 白名單（只一台）
+
+優：簡單、CoA 原生通、無 SSH key 管理。
+劣：管理多台 Moxa 時各自獨立 user pool、無 HA。
+
+PoC、單站、低需求用 all-in-one；多站、企業用雙 server。
+
+---
+
+## 18. License 與商品散佈注意
+
+主要元件 license：
+- **CoovaChilli** — GPLv2（強 copyleft）
+- **FreeRADIUS** — GPLv2
+- **daloRADIUS** — GPLv2
+- **MariaDB Server** — GPLv2（server-only，網路使用不感染）
+- Apache HTTPD / PHP — permissive
+
+散佈成 appliance product：
+- 必附 source 或 written offer
+- 改過的 chilli `login.chi` / `hotspotlogin.cgi` 屬衍生作品 → 須 GPL 開源
+- 你的 install scripts、配置檔、品牌 logo、SSH wrapper script 可保持 proprietary
+
+詳見 `docs/radius-public-server-manual.md` license 章節。
