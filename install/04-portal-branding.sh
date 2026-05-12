@@ -21,7 +21,9 @@ log "Phase D — portal branding (logo / css / html)"
 [[ -d "$CHILLI_WWW" ]] || die "$CHILLI_WWW not found — is coova-chilli installed?"
 
 # 1. Drop in branded assets. backup_once preserves the package originals.
-for asset in logo.svg style.css login.html index.php; do
+#    login.chi + login_success.tmpl are customized to force post-login redirect
+#    to google.com (see configs/chilli/www/login.chi success block).
+for asset in logo.svg style.css login.html index.php login.chi login_success.tmpl; do
     src="$CONFIG_DIR/chilli/www/$asset"
     dst="$CHILLI_WWW/$asset"
     [[ -f "$src" ]] || { warn "Missing $src — skipping"; continue; }
