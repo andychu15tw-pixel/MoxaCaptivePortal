@@ -460,26 +460,25 @@ def add_arrow(slide, x1, y1, x2, y2, color=C_NAVY, width_pt=1.6, dashed=False, h
 
 s = prs.slides.add_slide(BLANK)
 add_rect(s, 0, 0, W, H, fill=C_WHITE)
-header_bar(s, "認證流程序列圖", "Client / chilli / RADIUS / DB 互動時序")
+header_bar(s, "認證流程序列圖", "對應上頁 6 步驟的時序視圖")
 orange_accent(s)
 
-# ── Lifeline columns ──
+# ── Lifeline columns (4 lanes, matching Slide 7 mention) ──
 lanes = [
-    ("📱  Client",      Inches(1.0), C_TEAL),
-    ("📶  Wi-Fi AP",    Inches(3.0), RGBColor(0x16,0x7A,0x8C)),
-    ("🖧  Moxa chilli", Inches(5.4), C_NAVY),
-    ("🛡  Public RADIUS", Inches(8.6), C_ORANGE),
-    ("🗄  MariaDB",     Inches(11.6), RGBColor(0x6C,0x3A,0x8C)),
+    ("📱  Client",     Inches(1.6),  C_TEAL),
+    ("🖧  chilli",     Inches(5.2),  C_NAVY),
+    ("🛡  FreeRADIUS", Inches(8.8),  C_ORANGE),
+    ("🗄  MariaDB",    Inches(11.9), RGBColor(0x6C,0x3A,0x8C)),
 ]
 lane_top = Inches(1.5)
-lane_bottom = Inches(7.1)
+lane_bottom = Inches(6.8)
 for label, cx, color in lanes:
-    add_rect(s, cx - Inches(0.85), lane_top, Inches(1.7), Inches(0.42), fill=color)
-    add_text(s, label, cx - Inches(0.83), lane_top + Inches(0.04),
-             Inches(1.66), Inches(0.36),
-             size=10.5, bold=True, color=C_WHITE, align=PP_ALIGN.CENTER)
+    add_rect(s, cx - Inches(1.0), lane_top, Inches(2.0), Inches(0.5), fill=color)
+    add_text(s, label, cx - Inches(0.98), lane_top + Inches(0.06),
+             Inches(1.96), Inches(0.4),
+             size=12, bold=True, color=C_WHITE, align=PP_ALIGN.CENTER)
     # dashed lifeline
-    lf = s.shapes.add_connector(1, cx, lane_top + Inches(0.45), cx, lane_bottom)
+    lf = s.shapes.add_connector(1, cx, lane_top + Inches(0.55), cx, lane_bottom)
     lf.line.color.rgb = C_MGRAY
     lf.line.width = Pt(0.75)
     lnel = lf._element.find(qn('p:spPr')).find(qn('a:ln'))
@@ -488,58 +487,60 @@ for label, cx, color in lanes:
     prst = etree.SubElement(lnel, qn('a:prstDash'))
     prst.set('val', 'dash')
 
-# Lane center x
-LX_CLIENT = Inches(1.0)
-LX_AP     = Inches(3.0)
-LX_CHILLI = Inches(5.4)
-LX_RADIUS = Inches(8.6)
-LX_DB     = Inches(11.6)
+LX_CLIENT = Inches(1.6)
+LX_CHILLI = Inches(5.2)
+LX_RADIUS = Inches(8.8)
+LX_DB     = Inches(11.9)
 
-# ── Steps ──
-# Each step: (y_offset_inches, x1_lane, x2_lane, color, num, label)
-y0 = 2.05  # start
-dy = 0.42
-
-steps = [
-    # (lane_from, lane_to, color, n, label, dashed)
-    (LX_CLIENT, LX_AP,     C_TEAL,   "1",  "Wi-Fi Association",                      False),
-    (LX_CLIENT, LX_CHILLI, C_TEAL,   "2",  "DHCP Discover/Offer/Req/ACK (192.168.182.x)", False),
-    (LX_CLIENT, LX_CHILLI, C_NAVY,   "3",  "HTTP GET example.com",                   False),
-    (LX_CHILLI, LX_CLIENT, C_ORANGE, "4",  "302 Redirect → portal CGI",              True),
-    (LX_CLIENT, LX_CHILLI, C_NAVY,   "5",  "GET /cgi-bin/hotspotlogin.cgi (portal)", False),
-    (LX_CHILLI, LX_CLIENT, C_NAVY,   "6",  "HTML 登入表單",                          True),
-    (LX_CLIENT, LX_CHILLI, C_NAVY,   "7",  "POST 帳號/密碼 → CGI 計算 CHAP-Response", False),
-    (LX_CHILLI, LX_RADIUS, C_ORANGE, "8",  "RADIUS Access-Request (CHAP)",           False),
-    (LX_RADIUS, LX_DB,     C_ORANGE, "9",  "SELECT radcheck/radreply WHERE user=",   False),
-    (LX_DB,     LX_RADIUS, C_ORANGE, "10", "rows (Cleartext-Password + WISPr attrs)", True),
-    (LX_RADIUS, LX_CHILLI, C_GREEN,  "11", "Access-Accept (WISPr-Bandwidth 等)",     True),
-    (LX_CHILLI, LX_RADIUS, C_ORANGE, "12", "Accounting-Request Start",               False),
-    (LX_CHILLI, LX_CLIENT, C_GREEN,  "13", "授權 ACL 開通 + 302 → google.com",       True),
+# ── 6 大步驟（與 Slide 7 對齊）每步驟可含 1-2 條箭頭 ──
+# group: (num, color, group_label, [(x1, x2, sub_label, dashed), ...])
+groups = [
+    ("①", C_TEAL,   "DHCP",
+        [(LX_CLIENT, LX_CHILLI, "Discover / Offer / Request / ACK  →  192.168.182.x + DNS=192.168.182.1", False)]),
+    ("②", C_ORANGE, "HTTP 攔截",
+        [(LX_CLIENT, LX_CHILLI, "HTTP GET  http://任意網站", False),
+         (LX_CHILLI, LX_CLIENT, "302 Redirect  →  /cgi-bin/hotspotlogin.cgi", True)]),
+    ("③", C_NAVY,   "Portal 登入",
+        [(LX_CLIENT, LX_CHILLI, "POST 帳號/密碼  →  CGI 計算 CHAP-Response", False)]),
+    ("④", C_TEAL,   "RADIUS Auth",
+        [(LX_CHILLI, LX_RADIUS, "Access-Request (User-Name + CHAP-Password)", False),
+         (LX_RADIUS, LX_DB,     "SELECT radcheck WHERE username=", False)]),
+    ("⑤", C_GREEN,  "Access-Accept",
+        [(LX_DB,     LX_RADIUS, "rows (Cleartext-Password + WISPr attrs)", True),
+         (LX_RADIUS, LX_CHILLI, "Access-Accept  +  Session-Timeout / WISPr-Bandwidth", True)]),
+    ("⑥", C_GREEN,  "上網",
+        [(LX_CHILLI, LX_CLIENT, "授權 ACL + leaky bucket 限速 + 302 google.com", True)]),
 ]
 
-for i, (x1, x2, color, num, label, dashed) in enumerate(steps):
-    y = Inches(y0 + i * dy)
-    # number badge
-    cx_num = min(x1, x2) - Inches(0.4)
-    add_rect(s, cx_num, y - Inches(0.13), Inches(0.32), Inches(0.26), fill=color)
-    add_text(s, num, cx_num, y - Inches(0.13), Inches(0.32), Inches(0.26),
-             size=10, bold=True, color=C_WHITE, align=PP_ALIGN.CENTER)
-    # arrow
-    add_arrow(s, x1, y, x2, y, color=color, dashed=dashed)
-    # label
-    mx = (x1 + x2) // 2
-    add_text(s, label, mx - Inches(2.2), y - Inches(0.32),
-             Inches(4.4), Inches(0.28),
-             size=9.5, color=color, align=PP_ALIGN.CENTER, italic=False)
+# Render
+y_cursor = 2.0
+for num, color, gtitle, arrows in groups:
+    # Group label badge on far left
+    badge_y = Inches(y_cursor)
+    add_rect(s, Inches(0.15), badge_y, Inches(1.05), Inches(0.4), fill=color)
+    add_text(s, f"{num} {gtitle}", Inches(0.15), badge_y + Inches(0.06),
+             Inches(1.05), Inches(0.32),
+             size=10.5, bold=True, color=C_WHITE, align=PP_ALIGN.CENTER)
 
-# ── Footer notes ──
+    # Draw arrows for this group
+    for j, (x1, x2, label, dashed) in enumerate(arrows):
+        ay = Inches(y_cursor + 0.12 + j * 0.42)
+        add_arrow(s, x1, ay, x2, ay, color=color, dashed=dashed, width_pt=1.8)
+        mx = (x1 + x2) // 2
+        add_text(s, label, mx - Inches(2.4), ay - Inches(0.32),
+                 Inches(4.8), Inches(0.28),
+                 size=9.5, color=color, align=PP_ALIGN.CENTER)
+
+    # Advance cursor by number of arrows
+    y_cursor += 0.45 * max(1, len(arrows)) + 0.25
+
+# ── Footer ──
 add_rect(s, Inches(0.3), Inches(7.0), Inches(12.7), Inches(0.42),
          fill=C_LGRAY)
 add_text(s,
-         "▸ 步驟 8-12 走 RADIUS UDP；CHAP 在 chilli↔RADIUS 之間驗算   "
-         "▸ 步驟 13 後：interim acct 每 300s + 條件式 CoA 踢人",
+         "─── = Request  ┄┄ = Response   |   ④⑤ 走 RADIUS UDP 1812/1813   |   ⑥ 後：interim acct 每 300s",
          Inches(0.4), Inches(7.05), Inches(12.5), Inches(0.35),
-         size=10, color=C_DKGRAY)
+         size=10, color=C_DKGRAY, align=PP_ALIGN.CENTER)
 
 # ════════════════════════════════════════════════════════════════════════════
 # SLIDE 8 — WISPr 限速
