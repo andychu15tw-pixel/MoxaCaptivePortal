@@ -434,6 +434,114 @@ add_text(s, "OS Captive Detection：iOS / Android / Windows 開機自動偵測 H
          size=11, bold=True, color=C_NAVY)
 
 # ════════════════════════════════════════════════════════════════════════════
+# SLIDE 7B — 認證流程序列圖 (Sequence Diagram)
+# ════════════════════════════════════════════════════════════════════════════
+from pptx.oxml.ns import qn
+from lxml import etree
+
+def add_arrow(slide, x1, y1, x2, y2, color=C_NAVY, width_pt=1.6, dashed=False, head_back=False):
+    """Add line with arrowhead at end (or both if head_back=True)."""
+    line = slide.shapes.add_connector(1, x1, y1, x2, y2)
+    line.line.color.rgb = color
+    line.line.width = Pt(width_pt)
+    spPr = line._element.find(qn('p:spPr'))
+    ln = spPr.find(qn('a:ln'))
+    if ln is None:
+        ln = etree.SubElement(spPr, qn('a:ln'))
+    if dashed:
+        prstDash = etree.SubElement(ln, qn('a:prstDash'))
+        prstDash.set('val', 'dash')
+    tailEnd = etree.SubElement(ln, qn('a:tailEnd'))
+    tailEnd.set('type', 'triangle'); tailEnd.set('w', 'med'); tailEnd.set('len', 'med')
+    if head_back:
+        headEnd = etree.SubElement(ln, qn('a:headEnd'))
+        headEnd.set('type', 'triangle'); headEnd.set('w', 'med'); headEnd.set('len', 'med')
+    return line
+
+s = prs.slides.add_slide(BLANK)
+add_rect(s, 0, 0, W, H, fill=C_WHITE)
+header_bar(s, "認證流程序列圖", "Client / chilli / RADIUS / DB 互動時序")
+orange_accent(s)
+
+# ── Lifeline columns ──
+lanes = [
+    ("📱  Client",      Inches(1.0), C_TEAL),
+    ("📶  Wi-Fi AP",    Inches(3.0), RGBColor(0x16,0x7A,0x8C)),
+    ("🖧  Moxa chilli", Inches(5.4), C_NAVY),
+    ("🛡  Public RADIUS", Inches(8.6), C_ORANGE),
+    ("🗄  MariaDB",     Inches(11.6), RGBColor(0x6C,0x3A,0x8C)),
+]
+lane_top = Inches(1.5)
+lane_bottom = Inches(7.1)
+for label, cx, color in lanes:
+    add_rect(s, cx - Inches(0.85), lane_top, Inches(1.7), Inches(0.42), fill=color)
+    add_text(s, label, cx - Inches(0.83), lane_top + Inches(0.04),
+             Inches(1.66), Inches(0.36),
+             size=10.5, bold=True, color=C_WHITE, align=PP_ALIGN.CENTER)
+    # dashed lifeline
+    lf = s.shapes.add_connector(1, cx, lane_top + Inches(0.45), cx, lane_bottom)
+    lf.line.color.rgb = C_MGRAY
+    lf.line.width = Pt(0.75)
+    lnel = lf._element.find(qn('p:spPr')).find(qn('a:ln'))
+    if lnel is None:
+        lnel = etree.SubElement(lf._element.find(qn('p:spPr')), qn('a:ln'))
+    prst = etree.SubElement(lnel, qn('a:prstDash'))
+    prst.set('val', 'dash')
+
+# Lane center x
+LX_CLIENT = Inches(1.0)
+LX_AP     = Inches(3.0)
+LX_CHILLI = Inches(5.4)
+LX_RADIUS = Inches(8.6)
+LX_DB     = Inches(11.6)
+
+# ── Steps ──
+# Each step: (y_offset_inches, x1_lane, x2_lane, color, num, label)
+y0 = 2.05  # start
+dy = 0.42
+
+steps = [
+    # (lane_from, lane_to, color, n, label, dashed)
+    (LX_CLIENT, LX_AP,     C_TEAL,   "1",  "Wi-Fi Association",                      False),
+    (LX_CLIENT, LX_CHILLI, C_TEAL,   "2",  "DHCP Discover/Offer/Req/ACK (192.168.182.x)", False),
+    (LX_CLIENT, LX_CHILLI, C_NAVY,   "3",  "HTTP GET example.com",                   False),
+    (LX_CHILLI, LX_CLIENT, C_ORANGE, "4",  "302 Redirect → portal CGI",              True),
+    (LX_CLIENT, LX_CHILLI, C_NAVY,   "5",  "GET /cgi-bin/hotspotlogin.cgi (portal)", False),
+    (LX_CHILLI, LX_CLIENT, C_NAVY,   "6",  "HTML 登入表單",                          True),
+    (LX_CLIENT, LX_CHILLI, C_NAVY,   "7",  "POST 帳號/密碼 → CGI 計算 CHAP-Response", False),
+    (LX_CHILLI, LX_RADIUS, C_ORANGE, "8",  "RADIUS Access-Request (CHAP)",           False),
+    (LX_RADIUS, LX_DB,     C_ORANGE, "9",  "SELECT radcheck/radreply WHERE user=",   False),
+    (LX_DB,     LX_RADIUS, C_ORANGE, "10", "rows (Cleartext-Password + WISPr attrs)", True),
+    (LX_RADIUS, LX_CHILLI, C_GREEN,  "11", "Access-Accept (WISPr-Bandwidth 等)",     True),
+    (LX_CHILLI, LX_RADIUS, C_ORANGE, "12", "Accounting-Request Start",               False),
+    (LX_CHILLI, LX_CLIENT, C_GREEN,  "13", "授權 ACL 開通 + 302 → google.com",       True),
+]
+
+for i, (x1, x2, color, num, label, dashed) in enumerate(steps):
+    y = Inches(y0 + i * dy)
+    # number badge
+    cx_num = min(x1, x2) - Inches(0.4)
+    add_rect(s, cx_num, y - Inches(0.13), Inches(0.32), Inches(0.26), fill=color)
+    add_text(s, num, cx_num, y - Inches(0.13), Inches(0.32), Inches(0.26),
+             size=10, bold=True, color=C_WHITE, align=PP_ALIGN.CENTER)
+    # arrow
+    add_arrow(s, x1, y, x2, y, color=color, dashed=dashed)
+    # label
+    mx = (x1 + x2) // 2
+    add_text(s, label, mx - Inches(2.2), y - Inches(0.32),
+             Inches(4.4), Inches(0.28),
+             size=9.5, color=color, align=PP_ALIGN.CENTER, italic=False)
+
+# ── Footer notes ──
+add_rect(s, Inches(0.3), Inches(7.0), Inches(12.7), Inches(0.42),
+         fill=C_LGRAY)
+add_text(s,
+         "▸ 步驟 8-12 走 RADIUS UDP；CHAP 在 chilli↔RADIUS 之間驗算   "
+         "▸ 步驟 13 後：interim acct 每 300s + 條件式 CoA 踢人",
+         Inches(0.4), Inches(7.05), Inches(12.5), Inches(0.35),
+         size=10, color=C_DKGRAY)
+
+# ════════════════════════════════════════════════════════════════════════════
 # SLIDE 8 — WISPr 限速
 # ════════════════════════════════════════════════════════════════════════════
 s = prs.slides.add_slide(BLANK)
@@ -731,7 +839,14 @@ for i, (bg, title, items) in enumerate(v2_items):
 # ════════════════════════════════════════════════════════════════════════════
 # SAVE
 # ════════════════════════════════════════════════════════════════════════════
-out = r"C:\Users\andy_chu\Desktop\CaptivePortal_FAE_Guide.pptx"
-prs.save(out)
-print(f"Saved: {out}")
+import os
+out_repo    = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CaptivePortal_FAE_Guide.pptx")
+out_desktop = r"C:\Users\andy_chu\Desktop\CaptivePortal_FAE_Guide.pptx"
+prs.save(out_repo)
+print(f"Saved: {out_repo}")
+try:
+    prs.save(out_desktop)
+    print(f"Saved: {out_desktop}")
+except Exception as e:
+    print(f"Desktop save skipped: {e}")
 print(f"Slides: {len(prs.slides)}")
